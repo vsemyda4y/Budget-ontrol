@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+r"""
+main.py — выгрузка worklogs из Jira Tempo за год + интеграция с системой маппинга колонок.
+Сохраняет:
+  1) Оригинальный Excel в папку WL (как раньше).
+  2) Канонический Excel + canonical_log + schema.json в WL\Результат.
+"""
+
+import os
+import json
+import time
+import requests
+import pandas as pd
+from workalendar.europe import Russia
+from datetime import datetime
+import concurrent.futures
+from openpyxl import load_workbook
+from pathlib import Path
+import numpy as np
+
+# === Конфиг (можно переопределить через ENV) ===
+JIRA_URL     = os.getenv("JIRA_URL", "https://jira.nlmk.com")
+BEARER_TOKEN = os.getenv("JIRA_TEMPO_TOKEN", "MzU0MzcxNjA3NDc2Orij/u46oRiprLkwp1B7r55Yx7bE")
+YEAR         = int(os.getenv("YEAR", "2025"))
+
+# Пути
+WL_DIR         = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\TCO\Data\Worklog")
+WL_OUT_DIR     = WL_DIR / "Результат"
+WL_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# === Интеграция с системой маппинга ===
+# Предполагается, что рядом со скриптом лежат canon_utils.py и columns_map.json
+from canon_utils import (
+    load_columns_map, canonize_fact, write_schema_json,
+    norm_text, to_mmYYYY
+)
+COLUMNS_MAP_PATH = Path(__file__).with_name("columns_map.json")
+
+HEADERS = {
+    "Authorization": f"Bearer {BEARER_TOKEN}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+# === Запрос к Tempo: все worklogs за год ===
+tempo_url = f"{JIRA_URL}/rest/tempo-timesheets/4/worklogs/search"
+payload = {
+    "from": f"{YEAR}-01-01",
+    "to": f"{YEAR}-12-31"
+}
+
+response = requests.post(tempo_url, json=payload, headers=HEADERS, timeout=120)
+if response.status_code != 200:
+    print("Ошибка запроса к Tempo:", response.status_code, response.text)
+    raise SystemExit(1)
+
+worklogs = response.json() or []
+
+# === Функция для получения ФИО по worker id ===
+def get_display_name(wid: str):
+    user_url = f"{JIRA_URL}/rest/api/2/user?key={wid}"
+    try:
+        r = requests.get(user_url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            user_data = r.json()
+            return wid, user_data.get("displayName", wid)
+        else:
+            return wid, wid
+    except Exception:
+        time.sleep(0.2)
+        return wid, wid
+
+# === Кеш маппинга JIRAUSER → ФИО ===
+worker_ids = list({w.get("worker") for w in worklogs if w.get("worker")})
+cache_file = WL_DIR / 'worker_map.json'
+
+if cache_file.exists():
+    with open(cache_file, 'r', encoding='utf-8') as f:
+        worker_map = json.load(f)
+    new_ids = [wid for wid in worker_ids if wid not in worker_map]
+    if new_ids:
+        print(f"Найдено новых пользователей: {len(new_ids)} — обновляем кэш...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            for wid, name in executor.map(get_display_name, new_ids):
+                worker_map[wid] = name
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(worker_map, f, ensure_ascii=False)
+else:
+    print(f"Первый запуск — создаём кэш пользователей ({len(worker_ids)})...")
+    worker_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for wid, name in executor.map(get_display_name, worker_ids):
+            worker_map[wid] = name
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(worker_map, f, ensure_ascii=False)
+
+# === Календарь рабочих дней по месяцам (Россия) ===
+cal = Russia()
+month_norms = {}
+for month in range(1, 13):
+    start = datetime(YEAR, month, 1)
+    end = (datetime(YEAR, month + 1, 1) - pd.Timedelta(days=1)) if month < 12 else datetime(YEAR, 12, 31)
+    norm = cal.get_working_days_delta(start.date(), end.date())
+    month_norms[f"{YEAR}-{month:02d}"] = norm
+
+# === Формируем "сырой" датафрейм как раньше ===
+rows = []
+for w in worklogs:
+    issue = w.get("issue", {}) or {}
+    attributes = w.get("attributes", {}) or {}
+    activity_type = (attributes.get("_Типактивности_", {}) or {}).get("value")
+
+    started_raw = w.get("started")
+    started_date = pd.to_datetime(started_raw, errors="coerce")
+    started_month = started_date.strftime("%Y-%m") if pd.notnull(started_date) else None
+    started_mm_yyyy = started_date.strftime("%m/%Y") if pd.notnull(started_date) else None
+
+    workdays_in_month = month_norms.get(started_month, 20)
+
+    seconds = w.get("timeSpentSeconds") or 0
+    hours = seconds / 3600.0
+    days = hours / 8.0
+    fte = (days / workdays_in_month) if workdays_in_month else None
+
+    rows.append({
+        "Issue Key": issue.get("key"),
+        "Project Key": issue.get("projectKey"),
+        "Issue Type": issue.get("issueType"),
+        "Account Key": issue.get("accountKey"),
+        "Worker Name": worker_map.get(w.get("worker"), w.get("worker")),
+        "Time Spent (h)": round(hours, 2),
+        "Activity Type": activity_type,
+        "Started (mm/yyyy)": started_mm_yyyy,
+        "FTE": round(fte, 3) if fte is not None else None
+    })
+
+df = pd.DataFrame(rows)
+
+# === Сохраняем исходный файл (как раньше) в WL ===
+WL_DIR.mkdir(parents=True, exist_ok=True)
+file_name_raw = f"worklogs_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+file_path_raw = WL_DIR / file_name_raw
+
+df.to_excel(file_path_raw, index=False)
+
+# автоширина
+wb = load_workbook(file_path_raw)
+ws = wb.active
+for col in ws.columns:
+    max_length = 0
+    col_letter = col[0].column_letter
+    for cell in col:
+        try:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        except Exception:
+            pass
+    ws.column_dimensions[col_letter].width = min(max_length + 2, 80)
+wb.save(file_path_raw)
+
+print(f"✅ Данные сохранены (RAW): {file_path_raw}")
+
+# === КАНОНИЗАЦИЯ ПО НАШЕЙ СИСТЕМЕ МАППИНГА ===
+columns_map = load_columns_map(COLUMNS_MAP_PATH)
+
+# переименуем столбцы в каноны (Сотрудник, Сервис, Месяц, FTE факт, Часы факт, …)
+df_can, canon_log = canonize_fact(df, columns_map, coerce_types=True)
+
+# нормализация ключевых полей на всякий случай
+if "Месяц" in df_can.columns:
+    df_can["Месяц"] = df_can["Месяц"].map(to_mmYYYY)
+if "Сотрудник" in df_can.columns:
+    df_can["Сотрудник"] = df_can["Сотрудник"].map(norm_text)
+if "Сервис" in df_can.columns:
+    df_can["Сервис"] = df_can["Сервис"].map(norm_text)
+
+# если не оказалось FTE факт — считаем из часов (на всякий случай)
+if "FTE факт" not in df_can.columns or df_can["FTE факт"].dropna().empty:
+    if "Часы факт" in df_can.columns:
+        df_can["FTE факт"] = pd.to_numeric(df_can["Часы факт"], errors="coerce") / 160.0
+    elif "Time Spent (h)" in df.columns:
+        df_can["FTE факт"] = pd.to_numeric(df["Time Spent (h)"], errors="coerce") / 160.0
+    else:
+        # оставляем как есть — план_vs_fact предупредит, если FTE факт обязателен
+        pass
+
+# === Сохраняем канонический файл в WL\Результат ===
+stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+file_name_can = f"worklogs_canonical_{stamp}.xlsx"
+file_path_can = WL_OUT_DIR / file_name_can
+
+with pd.ExcelWriter(file_path_can, engine="openpyxl") as w:
+    df_can.to_excel(w, index=False, sheet_name="worklogs")
+    if not canon_log.empty:
+        canon_log.to_excel(w, index=False, sheet_name="canonical_log")
+
+# автоширина
+try:
+    wb = load_workbook(file_path_can)
+    for ws in wb.worksheets:
+        for col in ws.columns:
+            max_length = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_length + 2, 80)
+    wb.save(file_path_can)
+except Exception as e:
+    print(f"Автоширина для канонического файла пропущена: {e}")
+
+# схема для canonical
+schema_path = file_path_can.with_suffix(".schema.json")
+write_schema_json(schema_path, {"worklogs": df_can})
+
+print(f"✅ Канонический файл: {file_path_can}")
+print(f"🧾 Схема:            {schema_path}")

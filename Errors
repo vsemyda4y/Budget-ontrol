@@ -1,10 +1,8 @@
+C:\Users\zaytsev_ra2\PycharmProjects\TCO\venv\lib\site-packages\openpyxl\workbook\child.py:99: UserWarning: Title is more than 31 characters. Some applications may not be able to read the file
+  warnings.warn("Title is more than 31 characters. Some applications may not be able to read the file")
 Traceback (most recent call last):
   File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 434, in <module>
     main()
-  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 324, in main
-    versions = list_versions(PROJECT_KEY)
-  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 132, in list_versions
-    versions = jira_get(f"{JIRA_URL}/rest/api/2/project/{project_key}/versions")
-  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 105, in jira_get
-    raise RuntimeError(f"GET {url} → {r.status_code}: {r.text[:500]}")
-RuntimeError: GET https://jira.nlmk.com/rest/api/2/project/None/versions → 404: {"errorMessages":["No project could be found with key 'None'."],"errors":{}}
+  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 384, in main
+    ws = xw.sheets[f"{vname[:28]}_Tree"]._worksheet  # type: Worksheet
+AttributeError: 'Worksheet' object has no attribute '_worksheet'

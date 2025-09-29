@@ -424,11 +424,7 @@ def main():
 
     writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
     with pd.ExcelWriter(writer_path, engine="openpyxl") as xw:
-        all_tree.to_excel(xw, index=False, sheet_name="Hierarchy")
-        ws_h: Worksheet = xw.sheets["Hierarchy"]
-        ws_h.auto_filter.ref = ws_h.dimensions
-        ws_h.freeze_panes = "A2"
-
+        # Только Tree-вкладки по каждой версии
         for vname, tree_df, links_df, _ov in per_release:
             sheet_tree = make_sheet_name(vname, "Tree")
             tree_df.to_excel(xw, index=False, sheet_name=sheet_tree)
@@ -444,13 +440,7 @@ def main():
             ws.auto_filter.ref = ws.dimensions
             ws.freeze_panes = "A2"
 
-            if not links_df.empty:
-                sheet_links = make_sheet_name(vname, "Links")
-                links_df.to_excel(xw, index=False, sheet_name=sheet_links)
-                ws2: Worksheet = xw.sheets[sheet_links]
-                ws2.auto_filter.ref = ws2.dimensions
-                ws2.freeze_panes = "A2"
-
+        # Сводная Overview оставляем (если нужна аналитика)
         if overview_rows:
             overview = pd.concat(overview_rows, ignore_index=True)
             pivot = pd.pivot_table(
@@ -467,6 +457,7 @@ def main():
             ws_ov.auto_filter.ref = ws_ov.dimensions
             ws_ov.freeze_panes = "A2"
 
+    # Автофит ширины всех листов
     excel_autofit_smart(writer_path, width_overrides={
         "Нода": 60,
         "Ссылка": 16,

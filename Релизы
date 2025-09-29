@@ -52,6 +52,7 @@ VERSIONS_FILTER   = [v.strip() for v in _env("VERSIONS_FILTER", "").split(",") i
 ONLY_UNRELEASED   = _env("ONLY_UNRELEASED", "1") == "1"
 MAX_ISSUES        = int(_env("MAX_ISSUES", "5000"))
 ENABLE_LINK_HIERARCHY = _env("ENABLE_LINK_HIERARCHY", "1") == "1"
+CONFLUENCE_HOST  = _env("CONFLUENCE_HOST", "confluence")
 
 if not PROJECT_KEY:
     raise SystemExit("PROJECT_KEY не задан. Укажи ключ проекта, например PROJECT_KEY=CSHRM")
@@ -111,6 +112,27 @@ def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = N
         wb.save(path)
     except Exception as e:
         print(f"[autofit] пропущено: {e}")
+
+# ========= Jira helpers =========
+
+def get_confluence_artifact(issue_key: str) -> str:
+    """Возвращает формулу Excel HYPERLINK на первую Confluence-ссылку из remotelink задачи.
+    Если не найдено — возвращает пустую строку."""
+    try:
+        arr = jira_get(f"{JIRA_URL}/rest/api/2/issue/{issue_key}/remotelink")
+    except Exception:
+        return ""
+    host = CONFLUENCE_HOST.lower().strip()
+    for rl in arr or []:
+        obj = (rl or {}).get("object") or {}
+        url = (obj.get("url") or "").strip()
+        title = (obj.get("title") or "Confluence").strip()
+        if url and (host in url.lower()):
+            # Защита кавычек для Excel-формулы
+            u = url.replace('"', '""')
+            t = title.replace('"', '""')
+            return f'=HYPERLINK("{u}","{t}")'
+    return ""
 
 # ========= Jira helpers =========
 
@@ -254,6 +276,14 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
                 links_rows.append({"From": k, "Direction": "outward", "Type": ltype, "To": outward})
                 link_pairs.append((k, outward))
 
+    # Кеш Confluence-артефактов (ленивая загрузка)
+    _artifact_cache: Dict[str, str] = {}
+    def artifact_for(key: str) -> str:
+        if key not in _artifact_cache:
+            _artifact_cache[key] = get_confluence_artifact(key)
+        return _artifact_cache[key]
+
+    # Виртуальная иерархия по ссылкам
     if ENABLE_LINK_HIERARCHY and LINK_HIERARCHY_RULES:
         rules = [(a.lower(), b.lower()) for a, b in LINK_HIERARCHY_RULES]
         for a, b in link_pairs:
@@ -274,6 +304,75 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
     roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
 
     def row_from_key(key: str, level: int, rel_name: str) -> dict:
+        it = by_key[key]
+        f = it.get("fields", {})
+        assignee = _g(f, ["assignee", "displayName"]) or ""
+        status = _g(f, ["status", "name"]) or ""
+        issue_type = issue_type_name(it)
+        priority = _g(f, ["priority", "name"]) or ""
+        created = _g(f, ["created"]) or ""
+        updated = _g(f, ["updated"]) or ""
+        summary = f.get("summary") or ""
+        sp_raw = f.get(STORY_POINTS_FIELD_ID) if STORY_POINTS_FIELD_ID else None
+        if isinstance(sp_raw, (int, float)):
+            story_points = sp_raw
+        else:
+            try:
+                story_points = float(sp_raw) if sp_raw is not None and str(sp_raw).strip() != "" else None
+            except Exception:
+                story_points = None
+        fix_versions = ", ".join((v.get("name") for v in (f.get("fixVersions") or [])))
+        parent_key = parent_map.get(key)
+        return {
+            "Release": rel_name,
+            "Level": level,
+            "Нода": ("  " * level) + summary,
+            "Ссылка": hyperlink_formula(key),
+            "Артефакт": artifact_for(key),
+            "Тип": issue_type,
+            "Статус": status,
+            "Исполнитель": assignee,
+            "Story Points": story_points,
+            "Priority": priority,
+            "Fix Version(s)": fix_versions,
+            "Created": created,
+            "Updated": updated,
+        }
+
+    rows: List[dict] = []
+
+    def walk_issue(key: str, level: int):
+        rows.append(row_from_key(key, level, release_name))
+        for ch in children.get(key, []):
+            walk_issue(ch, level + 1)
+
+    for e in sorted(epics):
+        rows.append(row_from_key(e, 0, release_name))
+        for k in sorted(set(children.get(e, []) + epic_children.get(e, []))):
+            walk_issue(k, 1)
+
+    if roots_wo_epic:
+        rows.append({
+            "Release": release_name,
+            "Level": 0,
+            "Нода": "(без эпика)",
+            "Ссылка": "",
+            "Артефакт": "",
+            "Тип": "",
+            "Статус": "",
+            "Исполнитель": "",
+            "Story Points": None,
+            "Priority": "",
+            "Fix Version(s)": "",
+            "Created": "",
+            "Updated": "",
+        })
+        for k in sorted(roots_wo_epic):
+            walk_issue(k, 1)
+
+    tree_df = pd.DataFrame(rows)
+    links_df = pd.DataFrame(links_rows) if links_rows else pd.DataFrame(columns=["From","Direction","Type","To"])
+    return tree_df, links_df(key: str, level: int, rel_name: str) -> dict:
         it = by_key[key]
         f = it.get("fields", {})
         assignee = _g(f, ["assignee", "displayName"]) or ""
@@ -411,7 +510,7 @@ def main():
         overview_rows.append(ov)
         tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
         tree_cols = [
-            "Level","Нода","Ссылка","Тип","Статус","Исполнитель",
+            "Level","Нода","Ссылка","Артефакт","Тип","Статус","Исполнитель",
             "Story Points","Priority","Fix Version(s)","Created","Updated"
         ]
         tree_df = tree_df[tree_cols]
@@ -461,6 +560,7 @@ def main():
     excel_autofit_smart(writer_path, width_overrides={
         "Нода": 60,
         "Ссылка": 16,
+        "Артефакт": 40,
         "Исполнитель": 28,
         "Fix Version(s)": 28,
         "Priority": 12,

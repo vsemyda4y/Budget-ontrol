@@ -4,18 +4,23 @@ Release Composer — выгрузка состава релизов по код�
 (эпики → истории/задачи → сабтаски) + связи задач (в т.ч. виртуальная иерархия по типам) → Excel c иерархией.
 
 ⚙️ Переменные окружения (можно задать в коде ниже):
-- JIRA_URL            — базовый URL Jira (например, https://jira.nlmk.com)
-- JIRA_BEARER_TOKEN   — Bearer-токен (можно тот же, что в Worklog_with_summary_labels.py)
-- PROJECT_KEY         — ключ проекта (например, "CSHRM")
-- VERSIONS_FILTER     — список имён версий через запятую (Fix Version). Если пусто — берём все подходящие.
-- ONLY_UNRELEASED     — "1" → только unreleased версии; "0" → все (по умолчанию "1")
-- MAX_ISSUES          — защитный лимит задач на одну версию (по умолчанию 5000)
-- ENABLE_LINK_HIERARCHY — "1" → строить виртуальную иерархию по линкам (см. LINK_HIERARCHY_RULES), по умолчанию "1"
-- CONFLUENCE_HOST     — подстрока хоста Confluence для поиска артефакта (по умолчанию "confluence")
+- JIRA_URL               — базовый URL Jira (например, https://jira.nlmk.com)
+- JIRA_BEARER_TOKEN      — Bearer-токен (можно тот же, что в Worklog_with_summary_labels.py)
+- PROJECT_KEY            — ключ проекта (например, "CSHRM")
+- VERSIONS_FILTER        — имена версий через запятую (FixVersion). Пусто → все подходящие.
+- ONLY_UNRELEASED        — "1" → только unreleased версии; "0" → все (по умолчанию "1")
+- MAX_ISSUES             — защитный лимит задач на одну версию (по умолчанию 5000)
+- ENABLE_LINK_HIERARCHY  — "1" → строить виртуальную иерархию по линкам (см. LINK_HIERARCHY_RULES), по умолчанию "1"
+- CONFLUENCE_HOST        — подстрока хоста Confluence (для поиска в remotelink), по умолчанию "confluence"
+- CONFLUENCE_API_BASE    — базовый URL API Confluence (напр., https://confluence.nlmk.com или https://confluence.nlmk.com/wiki)
+- CONFLUENCE_AUTH_MODE   — "bearer" | "basic" | "none" (авторизация к Confluence для подтяжки title)
+- CONFLUENCE_BEARER_TOKEN— токен для bearer-режима
+- CONFLUENCE_USER        — логин (для basic)
+- CONFLUENCE_PASSWORD    — пароль/API-token (для basic)
 
 📦 Выходной Excel:
 - Только листы <Release>_Tree — иерархия для каждой версии.
-- Overview — сводная по типам/статусам (оставил; скажешь — уберу).
+- Overview — сводная по типам/статусам (оставлено; скажешь — уберу).
 
 Колонки на листах ..._Tree:
 Level, Нода, Ссылка, Артефакт, Тип, Статус, Исполнитель, Story Points, Priority, Fix Version(s), Created, Updated
@@ -26,6 +31,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -45,14 +51,20 @@ def _env(key: str, default: Optional[str] = None) -> str:
         return default or ""
     return val
 
-JIRA_URL              = _env("JIRA_URL", "https://jira.nlmk.com").rstrip("/")
-JIRA_BEARER_TOKEN     = _env("JIRA_BEARER_TOKEN", _env("JIRA_TEMPO_TOKEN", ""))
-PROJECT_KEY           = _env("PROJECT_KEY", "CSHRM")
-VERSIONS_FILTER       = [v.strip() for v in _env("VERSIONS_FILTER", "").split(",") if v.strip()]
-ONLY_UNRELEASED       = _env("ONLY_UNRELEASED", "1") == "1"
-MAX_ISSUES            = int(_env("MAX_ISSUES", "5000"))
-ENABLE_LINK_HIERARCHY = _env("ENABLE_LINK_HIERARCHY", "1") == "1"
-CONFLUENCE_HOST       = _env("CONFLUENCE_HOST", "confluence")
+JIRA_URL               = _env("JIRA_URL", "https://jira.nlmk.com").rstrip("/")
+JIRA_BEARER_TOKEN      = _env("JIRA_BEARER_TOKEN", _env("JIRA_TEMPO_TOKEN", ""))
+PROJECT_KEY            = _env("PROJECT_KEY", "CSHRM")
+VERSIONS_FILTER        = [v.strip() for v in _env("VERSIONS_FILTER", "").split(",") if v.strip()]
+ONLY_UNRELEASED        = _env("ONLY_UNRELEASED", "1") == "1"
+MAX_ISSUES             = int(_env("MAX_ISSUES", "5000"))
+ENABLE_LINK_HIERARCHY  = _env("ENABLE_LINK_HIERARCHY", "1") == "1"
+
+CONFLUENCE_HOST        = _env("CONFLUENCE_HOST", "confluence")
+CONFLUENCE_API_BASE    = _env("CONFLUENCE_API_BASE", "")
+CONFLUENCE_AUTH_MODE   = _env("CONFLUENCE_AUTH_MODE", "bearer")  # bearer|basic|none
+CONFLUENCE_BEARER_TOKEN= _env("CONFLUENCE_BEARER_TOKEN", "")
+CONFLUENCE_USER        = _env("CONFLUENCE_USER", "")
+CONFLUENCE_PASSWORD    = _env("CONFLUENCE_PASSWORD", "")
 
 if not PROJECT_KEY:
     raise SystemExit("PROJECT_KEY не задан. Укажи ключ проекта, например PROJECT_KEY=CSHRM")
@@ -72,8 +84,8 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= Утилиты Excel =========
 
-# Имя листа Excel максимум 31 символ, чистим недопустимые знаки
 def make_sheet_name(base: str, suffix: str) -> str:
+    """Имя листа ≤31 символ и без недопустимых знаков."""
     safe = re.sub(r'[:\\/?*\[\]]', '_', str(base or 'Release'))
     max_base = 31 - (len(suffix) + 1)  # +1 под "_"
     if max_base < 1:
@@ -165,7 +177,9 @@ def list_versions(project_key: str) -> List[dict]:
             "releaseDate": v.get("releaseDate"),
             "overdue": v.get("overdue"),
         })
-    out.sort(key=lambda x: (x.get("releaseDate") is None, x.get("releaseDate") or "9999-12-31", str(x.get("name") or "")))
+    out.sort(key=lambda x: (x.get("releaseDate") is None,
+                            x.get("releaseDate") or "9999-12-31",
+                            str(x.get("name") or "")))
     if not out:
         print("[warn] Версии не найдены по заданным фильтрам. Попробуй снять ONLY_UNRELEASED или задать VERSIONS_FILTER.")
     return out
@@ -189,9 +203,78 @@ def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dic
             break
     return issues
 
+# ========= Confluence helpers =========
+
+def _conf_build_bases(url_hint: str = "") -> List[str]:
+    bases: List[str] = []
+    if CONFLUENCE_API_BASE:
+        bases.append(CONFLUENCE_API_BASE.rstrip('/'))
+    if url_hint:
+        u = urlparse(url_hint)
+        if u.scheme and u.netloc:
+            base = f"{u.scheme}://{u.netloc}"
+            bases.append(base)
+            bases.append(base + "/wiki")  # для некоторых инсталляций
+    # уникализация с сохранением порядка
+    uniq = []
+    for b in bases:
+        if b not in uniq:
+            uniq.append(b)
+    return uniq
+
+def _conf_headers():
+    h = {"Accept": "application/json"}
+    if CONFLUENCE_AUTH_MODE == "bearer" and CONFLUENCE_BEARER_TOKEN:
+        h["Authorization"] = f"Bearer {CONFLUENCE_BEARER_TOKEN}"
+    return h
+
+def _conf_auth():
+    if CONFLUENCE_AUTH_MODE == "basic" and CONFLUENCE_USER and CONFLUENCE_PASSWORD:
+        return (CONFLUENCE_USER, CONFLUENCE_PASSWORD)
+    return None
+
+def _extract_page_id(url: str) -> Optional[str]:
+    try:
+        if not url:
+            return None
+        m = re.search(r"[?&]pageId=(\d+)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"/pages/(\d+)(?:/|$)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"/spaces/[^/]+/pages/(\d+)(?:/|$)", url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def _fetch_confluence_title(page_id: str, url_hint: str = "") -> Optional[str]:
+    if not page_id:
+        return None
+    import requests as _rq
+    bases = _conf_build_bases(url_hint)
+    headers = _conf_headers()
+    auth = _conf_auth()
+    for base in bases:
+        for path in ("rest/api/content", "wiki/rest/api/content"):
+            api = f"{base}/{path}/{page_id}"
+            try:
+                r = _rq.get(api, headers=headers, auth=auth, timeout=30)
+                if r.status_code == 200:
+                    data = r.json()
+                    title = (data.get("title") or "").strip()
+                    if title:
+                        return title
+            except Exception:
+                continue
+    return None
+
 def get_confluence_artifact(issue_key: str) -> str:
-    """Возвращает формулу Excel HYPERLINK на первую Confluence-ссылку из remotelink задачи.
-    Если не найдено — возвращает пустую строку.
+    """Возвращает формулу Excel HYPERLINK на Confluence-страницу из remotelink задачи.
+    1) Берём первую ссылку, чей URL содержит CONFLUENCE_HOST
+    2) Используем title из remotelink, а если он пустой/генерик — подтягиваем настоящий title из Confluence REST по pageId
     """
     try:
         arr = jira_get(f"{JIRA_URL}/rest/api/2/issue/{issue_key}/remotelink")
@@ -201,21 +284,32 @@ def get_confluence_artifact(issue_key: str) -> str:
     for rl in arr or []:
         obj = (rl or {}).get("object") or {}
         url = (obj.get("url") or "").strip()
-        title = (obj.get("title") or "Confluence").strip()
+        title = (obj.get("title") or "").strip()
         if url and (host in url.lower()):
+            generic_titles = {"confluence", "view page", "page", "страница"}
+            if not title or title.strip().lower() in generic_titles:
+                page_id = _extract_page_id(url)
+                fetched = _fetch_confluence_title(page_id, url_hint=url) if page_id else None
+                if fetched:
+                    title = fetched
+            if not title:
+                title = "Confluence"
             u = url.replace('"', '""')
             t = title.replace('"', '""')
             return f'=HYPERLINK("{u}","{t}")'
     return ""
 
 # ========= Иерархия по линкам =========
-# Правила "виртуальной" иерархии по ссылкам: parent_type → child_type (case-insensitive)
+# parent_type → child_type (case-insensitive)
 LINK_HIERARCHY_RULES = [
     ("engineering concept", "change request"),
     ("support", "bugfix"),
 ]
 
 # ========= Построение иерархии =========
+
+EPIC_LINK_FIELD_ID: Optional[str] = None
+STORY_POINTS_FIELD_ID: Optional[str] = None
 
 def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Строит иерархию и таблицу связей для заданного релиза.
@@ -244,21 +338,21 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         return _g(i.get("fields", {}), ["issuetype", "name"]) or ""
 
     for k, it in by_key.items():
-        fields = it.get("fields", {})
+        flds = it.get("fields", {})
         # parent/subtasks
-        parent = _g(fields, ["parent", "key"]) or None
+        parent = _g(flds, ["parent", "key"]) or None
         parent_map[k] = parent
         if parent:
             children.setdefault(parent, []).append(k)
         # epic link
-        epic = fields.get(epic_link_field) if epic_link_field else None
+        epic = flds.get(epic_link_field) if epic_link_field else None
         if isinstance(epic, dict):
             epic = epic.get("key")
         epic_of[k] = epic
         if epic:
             epic_children.setdefault(epic, []).append(k)
-        # issue links (собираем пары)
-        for l in fields.get("issuelinks") or []:
+        # issue links
+        for l in flds.get("issuelinks") or []:
             ltype = _g(l, ["type", "name"]) or ""
             inward = _g(l, ["inwardIssue", "key"]) or None
             outward = _g(l, ["outwardIssue", "key"]) or None
@@ -318,9 +412,8 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             except Exception:
                 story_points = None
         fix_versions = ", ".join((v.get("name") for v in (f.get("fixVersions") or [])))
-        # parent_key = parent_map.get(key)  # тех. поле — в выводе не используем
         return {
-            "Release": rel_name,  # тех. поле — не выводим
+            "Release": rel_name,  # тех. поле (в Excel не выводим)
             "Level": level,
             "Нода": ("  " * level) + summary,
             "Ссылка": hyperlink_formula(key),
@@ -374,20 +467,18 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
 
 # ========= Основной сценарий =========
 
-EPIC_LINK_FIELD_ID = None
-STORY_POINTS_FIELD_ID = None
-
 def main():
     global EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID
 
-    # Диагностика настроек перед стартом
     print("=== Release Composer: старт ===")
-    print(f"JIRA_URL              : {JIRA_URL}")
-    print(f"PROJECT_KEY           : {PROJECT_KEY}")
-    print(f"ONLY_UNRELEASED       : {ONLY_UNRELEASED}")
-    print(f"VERSIONS_FILTER       : {', '.join(VERSIONS_FILTER) if VERSIONS_FILTER else '(все подходящие)'}")
-    print(f"ENABLE_LINK_HIERARCHY : {ENABLE_LINK_HIERARCHY}")
-    print(f"CONFLUENCE_HOST       : {CONFLUENCE_HOST}")
+    print(f"JIRA_URL               : {JIRA_URL}")
+    print(f"PROJECT_KEY            : {PROJECT_KEY}")
+    print(f"ONLY_UNRELEASED        : {ONLY_UNRELEASED}")
+    print(f"VERSIONS_FILTER        : {', '.join(VERSIONS_FILTER) if VERSIONS_FILTER else '(все подходящие)'}")
+    print(f"ENABLE_LINK_HIERARCHY  : {ENABLE_LINK_HIERARCHY}")
+    print(f"CONFLUENCE_HOST        : {CONFLUENCE_HOST}")
+    print(f"CONFLUENCE_API_BASE    : {CONFLUENCE_API_BASE or '(не задан)'}")
+    print(f"CONFLUENCE_AUTH_MODE   : {CONFLUENCE_AUTH_MODE}")
 
     print("→ Получаю список версий...")
     versions = list_versions(PROJECT_KEY)
@@ -436,7 +527,7 @@ def main():
         ov = pd.DataFrame(tmp)
         overview_rows.append(ov)
 
-        # Иерархия (с учётом LINK_HIERARCHY_RULES)
+        # Иерархия
         tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
         # Итоговые колонки для выдачи
         tree_cols = [

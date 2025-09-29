@@ -34,12 +34,26 @@ import pandas as pd
 import requests
 
 # ========= ENV =========
-JIRA_URL          = os.getenv("JIRA_URL", "https://jira.nlmk.com").rstrip("/")
-JIRA_BEARER_TOKEN = os.getenv("JIRA_BEARER_TOKEN", os.getenv("JIRA_TEMPO_TOKEN", ""))
-PROJECT_KEY       = os.getenv("PROJECT_KEY", "CSHRM").strip()
-VERSIONS_FILTER   = [v.strip() for v in os.getenv("VERSIONS_FILTER", "").split(",") if v.strip()]
-ONLY_UNRELEASED   = os.getenv("ONLY_UNRELEASED", "1") == "1"
-MAX_ISSUES        = int(os.getenv("MAX_ISSUES", "5000"))
+
+def _env(key: str, default: Optional[str] = None) -> str:
+    """Безопасное чтение переменных окружения с защитой от пустых/"None"/дефисов."""
+    val = os.getenv(key)
+    if val is None:
+        return default or ""
+    val = str(val).strip()
+    if val.lower() in {"none", "null", "", "-", "—", "–"}:
+        return default or ""
+    return val
+
+JIRA_URL          = _env("JIRA_URL", "https://jira.nlmk.com").rstrip("/")
+JIRA_BEARER_TOKEN = _env("JIRA_BEARER_TOKEN", _env("JIRA_TEMPO_TOKEN", ""))
+PROJECT_KEY       = _env("PROJECT_KEY", "CSHRM")
+VERSIONS_FILTER   = [v.strip() for v in _env("VERSIONS_FILTER", "").split(",") if v.strip()]
+ONLY_UNRELEASED   = _env("ONLY_UNRELEASED", "1") == "1"
+MAX_ISSUES        = int(_env("MAX_ISSUES", "5000"))
+
+if not PROJECT_KEY:
+    raise SystemExit("PROJECT_KEY не задан. Укажи ключ проекта, например PROJECT_KEY=CSHRM")
 
 if not JIRA_BEARER_TOKEN:
     raise SystemExit("ENV JIRA_BEARER_TOKEN/JIRA_TEMPO_TOKEN не задан — нужен Bearer токен Jira.")
@@ -58,6 +72,16 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
+
+# Имя листа Excel максимум 31 символ
+# Пример: make_sheet_name("CSHRM 2025.10", "Tree") → "CSHRM 2025.10_Tree" (усечёт базу при необходимости)
+def make_sheet_name(base: str, suffix: str) -> str:
+    safe = re.sub(r'[:\/?*\[\]]', '_', str(base or 'Release'))
+    max_base = 31 - (len(suffix) + 1)  # +1 под подчёркивание
+    if max_base < 1:
+        max_base = 1
+    safe = safe[:max_base]
+    return f"{safe}_{suffix}"
 
 def _visible_text(val: object) -> str:
     if val is None:
@@ -129,6 +153,8 @@ def get_field_ids() -> Dict[str, str]:
 
 
 def list_versions(project_key: str) -> List[dict]:
+    if not project_key or str(project_key).strip().lower() in {"none", "null", "-", "—", "–"}:
+        raise SystemExit("list_versions: пустой PROJECT_KEY — задай PROJECT_KEY=CSHRM (или свой)")
     versions = jira_get(f"{JIRA_URL}/rest/api/2/project/{project_key}/versions")
     out = []
     for v in versions:
@@ -145,8 +171,9 @@ def list_versions(project_key: str) -> List[dict]:
             "releaseDate": v.get("releaseDate"),
             "overdue": v.get("overdue"),
         })
-    # Стабильная сортировка: по дате релиза (пустые в конец), затем по имени
     out.sort(key=lambda x: (x.get("releaseDate") is None, x.get("releaseDate") or "9999-12-31", str(x.get("name") or "")))
+    if not out:
+        print("[warn] Версии не найдены по заданным фильтрам. Попробуй снять ONLY_UNRELEASED или задать VERSIONS_FILTER.")
     return out
 
 
@@ -319,7 +346,13 @@ STORY_POINTS_FIELD_ID = None
 def main():
     global FIELDS_CACHE, EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID
 
-    print(f"Проект: {PROJECT_KEY}")
+    # Диагностика настроек перед стартом — сразу видно, что мы реально используем
+    print("=== Release Composer: старт ===")
+    print(f"JIRA_URL        : {JIRA_URL}")
+    print(f"PROJECT_KEY     : {PROJECT_KEY}")
+    print(f"ONLY_UNRELEASED : {ONLY_UNRELEASED}")
+    print(f"VERSIONS_FILTER : {', '.join(VERSIONS_FILTER) if VERSIONS_FILTER else '(все подходящие)'}")
+
     print("→ Получаю список версий...")
     versions = list_versions(PROJECT_KEY)
     if not versions:
@@ -378,10 +411,11 @@ def main():
                 "Story Points","Epic","Родитель","Priority","Fix Version(s)","Created","Updated"
             ]
             tree_df = tree_df[tree_cols]
-            tree_df.to_excel(xw, index=False, sheet_name=f"{vname[:28]}_Tree")
+            sheet_tree = make_sheet_name(vname, "Tree")
+tree_df.to_excel(xw, index=False, sheet_name=sheet_tree)
 
             # Установим группировку строк (outlineLevel по колонке Level)
-            ws = xw.sheets[f"{vname[:28]}_Tree"]._worksheet  # type: Worksheet
+            ws: Worksheet = xw.sheets[sheet_tree]
             for i in range(2, ws.max_row + 1):  # без заголовка
                 try:
                     level_val = tree_df.iloc[i - 2]["Level"] or 0
@@ -395,8 +429,9 @@ def main():
 
             # Связи задач
             if not links_df.empty:
-                links_df.to_excel(xw, index=False, sheet_name=f"{vname[:28]}_Links")
-                ws2 = xw.sheets[f"{vname[:28]}_Links"]._worksheet
+                sheet_links = make_sheet_name(vname, "Links")
+links_df.to_excel(xw, index=False, sheet_name=sheet_links)
+                ws2: Worksheet = xw.sheets[sheet_links]
                 ws2.auto_filter.ref = ws2.dimensions
                 ws2.freeze_panes = "A2"
 
@@ -431,4 +466,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Поддержка запуска из консоли с параметрами: python Release.py CSHRM "Rel 2025.10"
+    import sys
+    if len(sys.argv) >= 2:
+        pk = sys.argv[1].strip()
+        if pk:
+            PROJECT_KEY = pk
+    if len(sys.argv) >= 3:
+        VERSIONS_FILTER = [sys.argv[2].strip()]
     main()

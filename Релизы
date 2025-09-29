@@ -1,0 +1,434 @@
+# -*- coding: utf-8 -*-
+"""
+Release Composer — выгрузка состава релизов по коду проекта JIRA
+(эпики → истории/задачи → сабтаски) + связи задач → Excel с иерархией и базовой визуализацией.
+
+⚙️ Переменные окружения (или задайте прямо в коде ниже):
+- JIRA_URL            — базовый URL вашей Jira (например, https://jira.nlmk.com)
+- JIRA_BEARER_TOKEN   — Bearer-токен (тот же, что в Worklog_with_summary_labels.py)
+- PROJECT_KEY         — ключ проекта (например, "CSHRM")
+- VERSIONS_FILTER     — список версий через запятую (имена релизов Fix Version), если пусто — все активные
+- ONLY_UNRELEASED     — "1" → брать только unreleased версии; "0" → все (по умолчанию "1")
+- MAX_ISSUES          — защитный лимит задач на одну версию (по умолчанию 5000)
+
+📦 Выходной Excel включает листы:
+- Overview         — сводка по релизам: количество задач по типам/статусам
+- Release_Tree     — иерархия: Release → Epic → Issue → Sub-task (с группировкой строк и HYPERLINK)
+- Relationships    — список связей задач (blocks/relates/duplicates/…)
+
+🧩 Особенности:
+- Автоматический поиск id кастом-полей "Epic Link" и "Story Points".
+- Иерархия строится по полям parent, subtasks и epic link; задачи без эпика выводятся под «(без эпика)».
+- В столбце «Нода» добавляется визуальный отступ по уровню (для удобного чтения даже без группировки).
+- Включён «умный» автофит ширины колонок.
+
+Зависимости: requests, pandas, openpyxl
+"""
+
+import os, re, time, json, math
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+
+# ========= ENV =========
+JIRA_URL          = os.getenv("JIRA_URL", "https://jira.nlmk.com").rstrip("/")
+JIRA_BEARER_TOKEN = os.getenv("JIRA_BEARER_TOKEN", os.getenv("JIRA_TEMPO_TOKEN", ""))
+PROJECT_KEY       = os.getenv("PROJECT_KEY", "CSHRM").strip()
+VERSIONS_FILTER   = [v.strip() for v in os.getenv("VERSIONS_FILTER", "").split(",") if v.strip()]
+ONLY_UNRELEASED   = os.getenv("ONLY_UNRELEASED", "1") == "1"
+MAX_ISSUES        = int(os.getenv("MAX_ISSUES", "5000"))
+
+if not JIRA_BEARER_TOKEN:
+    raise SystemExit("ENV JIRA_BEARER_TOKEN/JIRA_TEMPO_TOKEN не задан — нужен Bearer токен Jira.")
+
+HEADERS = {
+    "Authorization": f"Bearer {JIRA_BEARER_TOKEN}",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+
+# ========= ПАПКИ ВЫХОДА =========
+OUT_DIR = Path.cwd() / "release_export"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ========= Утилиты Excel =========
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+def _visible_text(val: object) -> str:
+    if val is None:
+        return ""
+    s = str(val)
+    if not s.startswith("="):
+        return s
+    m = re.match(r'^\s*=\s*HYPERLINK\s*\(\s*"[^"]*"\s*[,;]\s*"([^"]*)"\s*\)\s*$', s, re.IGNORECASE)
+    return m.group(1) if m else s
+
+def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = None,
+                        clamp_min: int = 6, clamp_max: int = 60):
+    try:
+        wb = load_workbook(path)
+        for ws in wb.worksheets:
+            headers = {cell.column: (cell.value or "") for cell in ws[1]}
+            for col_cells in ws.columns:
+                col_idx = col_cells[0].column
+                head = str(headers.get(col_idx, "")).strip()
+                if width_overrides and head in width_overrides:
+                    ws.column_dimensions[get_column_letter(col_idx)].width = width_overrides[head]
+                    continue
+                max_len = max(len(_visible_text(c.value)) if c.value is not None else 0 for c in col_cells)
+                max_len = max(max_len, len(head))
+                ws.column_dimensions[get_column_letter(col_idx)].width = max(clamp_min, min(max_len + 2, clamp_max))
+        wb.save(path)
+    except Exception as e:
+        print(f"[autofit] пропущено: {e}")
+
+# ========= Jira helpers =========
+
+def hyperlink_formula(key: str) -> str:
+    if not key:
+        return ""
+    k = str(key).strip().replace('"', '""')
+    return f'=HYPERLINK("{JIRA_URL}/browse/{k}","{k}")'
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+
+def jira_get(url: str, params: Optional[dict] = None) -> dict:
+    r = SESSION.get(url, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"GET {url} → {r.status_code}: {r.text[:500]}")
+    return r.json()
+
+
+def jira_post(url: str, payload: dict) -> dict:
+    r = SESSION.post(url, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"POST {url} → {r.status_code}: {r.text[:500]}")
+    return r.json()
+
+
+def get_field_ids() -> Dict[str, str]:
+    """Возвращает id кастом-полей для Epic Link и Story Points."""
+    fields = jira_get(f"{JIRA_URL}/rest/api/2/field")
+    epic_link_id = None
+    story_points_id = None
+    for f in fields:
+        name = (f.get("name") or "").strip().lower()
+        fid = f.get("id")
+        if name == "epic link":
+            epic_link_id = fid
+        if name == "story points":
+            story_points_id = fid
+    return {"epic_link": epic_link_id, "story_points": story_points_id}
+
+
+def list_versions(project_key: str) -> List[dict]:
+    versions = jira_get(f"{JIRA_URL}/rest/api/2/project/{project_key}/versions")
+    out = []
+    for v in versions:
+        if VERSIONS_FILTER and v.get("name") not in VERSIONS_FILTER:
+            continue
+        if ONLY_UNRELEASED and v.get("released"):
+            continue
+        if v.get("archived"):
+            continue
+        out.append({
+            "id": v.get("id"),
+            "name": v.get("name"),
+            "released": v.get("released"),
+            "releaseDate": v.get("releaseDate"),
+            "overdue": v.get("overdue"),
+        })
+    # Стабильная сортировка: по дате релиза (пустые в конец), затем по имени
+    out.sort(key=lambda x: (x.get("releaseDate") is None, x.get("releaseDate") or "9999-12-31", str(x.get("name") or "")))
+    return out
+
+
+def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dict]:
+    url = f"{JIRA_URL}/rest/api/2/search"
+    start_at = 0
+    issues: List[dict] = []
+    while True:
+        payload = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": min(100, max_results - start_at),
+            "fields": fields,
+        }
+        data = jira_post(url, payload)
+        issues.extend(data.get("issues", []))
+        start_at += len(data.get("issues", []))
+        if start_at >= data.get("total", 0) or start_at >= max_results:
+            break
+    return issues
+
+# ========= Построение иерархии =========
+
+def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Строит иерархию и таблицу связей для заданного релиза."""
+    by_key = {i.get("key"): i for i in issues}
+
+    def _g(obj, path: List[str]):
+        for p in path:
+            if obj is None:
+                return None
+            obj = obj.get(p) if isinstance(obj, dict) else None
+        return obj
+
+    # Подготовим индексы
+    children: Dict[str, List[str]] = {}
+    epic_children: Dict[str, List[str]] = {}
+    parent_map: Dict[str, Optional[str]] = {}
+    epic_of: Dict[str, Optional[str]] = {}
+
+    # Соберём связи
+    links_rows: List[dict] = []
+
+    for k, it in by_key.items():
+        fields = it.get("fields", {})
+        # parent/subtask
+        parent = _g(fields, ["parent", "key"]) or None
+        parent_map[k] = parent
+        if parent:
+            children.setdefault(parent, []).append(k)
+        # epic link → эпик-дети
+        epic = fields.get(epic_link_field) if epic_link_field else None
+        if isinstance(epic, dict):
+            epic = epic.get("key")
+        epic_of[k] = epic
+        if epic:
+            epic_children.setdefault(epic, []).append(k)
+
+        # связи задач
+        for l in fields.get("issuelinks") or []:
+            ltype = _g(l, ["type", "name"]) or ""
+            inward = _g(l, ["inwardIssue", "key"]) or None
+            outward = _g(l, ["outwardIssue", "key"]) or None
+            if inward:
+                links_rows.append({"From": k, "Direction": "inward", "Type": ltype, "To": inward})
+            if outward:
+                links_rows.append({"From": k, "Direction": "outward", "Type": ltype, "To": outward})
+
+    # Определим типы
+    def issue_type_name(i: dict) -> str:
+        return _g(i.get("fields", {}), ["issuetype", "name"]) or ""
+
+    def is_epic(i: dict) -> bool:
+        return issue_type_name(i).lower() == "epic"
+
+    # Корневые группы в релизе: все эпики + задачи без эпика и без родителя
+    epics = [k for k, it in by_key.items() if is_epic(it)]
+    roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
+
+    def row_from_key(key: str, level: int, rel_name: str) -> dict:
+        it = by_key[key]
+        f = it.get("fields", {})
+        assignee = _g(f, ["assignee", "displayName"]) or ""
+        status = _g(f, ["status", "name"]) or ""
+        issue_type = issue_type_name(it)
+        priority = _g(f, ["priority", "name"]) or ""
+        created = _g(f, ["created"]) or ""
+        updated = _g(f, ["updated"]) or ""
+        summary = f.get("summary") or ""
+        sp = f.get(STORY_POINTS_FIELD_ID) if STORY_POINTS_FIELD_ID else None
+        if isinstance(sp, (int, float)):
+            story_points = sp
+        else:
+            try:
+                story_points = float(sp) if sp is not None and str(sp).strip() != "" else None
+            except:
+                story_points = None
+        fix_versions = ", ".join((v.get("name") for v in (f.get("fixVersions") or [])))
+        epic_key = epic_of.get(key) or (key if issue_type.lower() == "epic" else None)
+        parent_key = parent_map.get(key)
+        return {
+            "Release": rel_name,
+            "Level": level,
+            "Нода": ("  " * level) + summary,
+            "Ключ": key,
+            "Ссылка": hyperlink_formula(key),
+            "Тип": issue_type,
+            "Статус": status,
+            "Исполнитель": assignee,
+            "Story Points": story_points,
+            "Epic": epic_key or "(без эпика)",
+            "Родитель": parent_key or "",
+            "Priority": priority,
+            "Fix Version(s)": fix_versions,
+            "Created": created,
+            "Updated": updated,
+        }
+
+    rows: List[dict] = []
+
+    def walk_issue(key: str, level: int):
+        rows.append(row_from_key(key, level, release_name))
+        # Сначала сабтаски
+        for ch in children.get(key, []):
+            walk_issue(ch, level + 1)
+
+    # 1) Эпики
+    for e in sorted(epics):
+        rows.append(row_from_key(e, 0, release_name))
+        # Под эпиком — истории/задачи, у которых epic_link = e и родителя нет (или родитель — эпик)
+        for k in sorted(set(epic_children.get(e, []))):
+            if parent_map.get(k) and parent_map.get(k) != e:
+                # если у story есть родитель не-эпик — обойдёмся через parent-дерево ниже
+                pass
+            walk_issue(k, 1)
+
+    # 2) Без эпика и без родителя — верхний уровень
+    if roots_wo_epic:
+        rows.append({
+            "Release": release_name,
+            "Level": 0,
+            "Нода": "(без эпика)",
+            "Ключ": "",
+            "Ссылка": "",
+            "Тип": "",
+            "Статус": "",
+            "Исполнитель": "",
+            "Story Points": None,
+            "Epic": "(без эпика)",
+            "Родитель": "",
+            "Priority": "",
+            "Fix Version(s)": "",
+            "Created": "",
+            "Updated": "",
+        })
+        for k in sorted(roots_wo_epic):
+            walk_issue(k, 1)
+
+    tree_df = pd.DataFrame(rows)
+    links_df = pd.DataFrame(links_rows) if links_rows else pd.DataFrame(columns=["From","Direction","Type","To"])
+    return tree_df, links_df
+
+# ========= Основной сценарий =========
+
+FIELDS_CACHE = None
+EPIC_LINK_FIELD_ID = None
+STORY_POINTS_FIELD_ID = None
+
+
+def main():
+    global FIELDS_CACHE, EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID
+
+    print(f"Проект: {PROJECT_KEY}")
+    print("→ Получаю список версий...")
+    versions = list_versions(PROJECT_KEY)
+    if not versions:
+        raise SystemExit("Нет подходящих версий (проверьте фильтры/права)")
+
+    # Определим id кастом-полей
+    ids = get_field_ids()
+    EPIC_LINK_FIELD_ID = ids.get("epic_link")
+    STORY_POINTS_FIELD_ID = ids.get("story_points")
+    if not EPIC_LINK_FIELD_ID:
+        print("[warn] Не нашёл id 'Epic Link' — иерархия может быть неполной")
+
+    # Какие поля запрашиваем
+    fields = [
+        "summary", "issuetype", "status", "assignee", "parent",
+        "subtasks", "issuelinks", "priority", "fixVersions", "created", "updated",
+    ]
+    if EPIC_LINK_FIELD_ID:
+        fields.append(EPIC_LINK_FIELD_ID)
+    if STORY_POINTS_FIELD_ID:
+        fields.append(STORY_POINTS_FIELD_ID)
+
+    all_overview: List[pd.DataFrame] = []
+    writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+    with pd.ExcelWriter(writer_path, engine="openpyxl") as xw:
+        # Обзорная таблица по всем релизам
+        overview_rows: List[dict] = []
+
+        for v in versions:
+            vname = v.get("name")
+            print(f"→ Версия: {vname}")
+            jql = f"project={PROJECT_KEY} AND fixVersion=\"{vname}\" ORDER BY issuetype, key"
+            issues = jql_search(jql, fields, max_results=MAX_ISSUES)
+            if not issues:
+                print("  (нет задач)")
+                continue
+
+            # Сводка по типам/статусам
+            tmp = []
+            for it in issues:
+                f = it.get("fields", {})
+                tmp.append({
+                    "Release": vname,
+                    "Тип": (f.get("issuetype") or {}).get("name"),
+                    "Статус": (f.get("status") or {}).get("name"),
+                    "Ключ": it.get("key"),
+                })
+            ov = pd.DataFrame(tmp)
+            overview_rows.append(ov)
+
+            # Иерархия
+            tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
+            # Порядок колонок
+            tree_cols = [
+                "Release","Level","Нода","Ключ","Ссылка","Тип","Статус","Исполнитель",
+                "Story Points","Epic","Родитель","Priority","Fix Version(s)","Created","Updated"
+            ]
+            tree_df = tree_df[tree_cols]
+            tree_df.to_excel(xw, index=False, sheet_name=f"{vname[:28]}_Tree")
+
+            # Установим группировку строк (outlineLevel по колонке Level)
+            ws = xw.sheets[f"{vname[:28]}_Tree"]._worksheet  # type: Worksheet
+            for i in range(2, ws.max_row + 1):  # без заголовка
+                try:
+                    level_val = tree_df.iloc[i - 2]["Level"] or 0
+                except Exception:
+                    level_val = 0
+                ws.row_dimensions[i].outlineLevel = int(level_val)
+            ws.sheet_properties.outlinePr.summaryBelow = True
+            ws.sheet_properties.outlinePr.applyStyles = True
+            ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = "A2"
+
+            # Связи задач
+            if not links_df.empty:
+                links_df.to_excel(xw, index=False, sheet_name=f"{vname[:28]}_Links")
+                ws2 = xw.sheets[f"{vname[:28]}_Links"]._worksheet
+                ws2.auto_filter.ref = ws2.dimensions
+                ws2.freeze_panes = "A2"
+
+        # Итоговый Overview
+        if overview_rows:
+            overview = pd.concat(overview_rows, ignore_index=True)
+            # Пивот: количество задач по типам/статусам в разрезе релиза
+            pivot = pd.pivot_table(
+                overview,
+                index=["Release","Тип"],
+                columns=["Статус"],
+                values="Ключ",
+                aggfunc="count",
+                fill_value=0,
+                margins=True,
+            )
+            pivot.to_excel(xw, sheet_name="Overview")
+            ws = xw.sheets["Overview"]._worksheet
+            ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = "A2"
+
+    # Автофит ширины
+    excel_autofit_smart(writer_path, width_overrides={
+        "Нода": 60,
+        "Ссылка": 16,
+        "Исполнитель": 28,
+        "Fix Version(s)": 28,
+        "Priority": 12,
+    })
+
+    print(f"Готово → {writer_path}")
+
+
+if __name__ == "__main__":
+    main()

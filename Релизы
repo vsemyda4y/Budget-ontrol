@@ -7,41 +7,36 @@ Release Composer — выгрузка состава релизов по код�
 - JIRA_URL            — базовый URL вашей Jira (например, https://jira.nlmk.com)
 - JIRA_BEARER_TOKEN   — Bearer-токен (тот же, что в Worklog_with_summary_labels.py)
 - PROJECT_KEY         — ключ проекта (например, "CSHRM")
-- VERSIONS_FILTER     — список версий через запятую (имена релизов Fix Version), если пусто — все подходящие
+- VERSIONS_FILTER     — список версий через запятую (имена релизов Fix Version), если пусто — все активные
 - ONLY_UNRELEASED     — "1" → брать только unreleased версии; "0" → все (по умолчанию "1")
 - MAX_ISSUES          — защитный лимит задач на одну версию (по умолчанию 5000)
 
 📦 Выходной Excel включает листы:
 - Overview         — сводка по релизам: количество задач по типам/статусам
-- <Release>_Tree   — иерархия: Release → Epic → Issue → Sub-task (с группировкой строк и HYPERLINK)
-- <Release>_Links  — список связей задач (blocks/relates/duplicates/…)
+- Release_Tree     — иерархия: Release → Epic → Issue → Sub-task (с группировкой строк и HYPERLINK)
+- Relationships    — список связей задач (blocks/relates/duplicates/…)
 
 🧩 Особенности:
 - Автоматический поиск id кастом-полей "Epic Link" и "Story Points".
 - Иерархия строится по полям parent, subtasks и epic link; задачи без эпика выводятся под «(без эпика)».
-- В столбце «Нода» добавляется визуальный отступ по уровню.
-- Умный автофит ширины колонок.
+- В столбце «Нода» добавляется визуальный отступ по уровню (для удобного чтения даже без группировки).
+- Включён «умный» автофит ширины колонок.
 
 Зависимости: requests, pandas, openpyxl
 """
 
-import os
-import re
-import json
+import os, re, time, json, math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
 
 # ========= ENV =========
 
 def _env(key: str, default: Optional[str] = None) -> str:
-    """Безопасное чтение переменных окружения с защитой от пустых/None/дефисов."""
+    """Безопасное чтение переменных окружения с защитой от пустых/"None"/дефисов."""
     val = os.getenv(key)
     if val is None:
         return default or ""
@@ -56,6 +51,7 @@ PROJECT_KEY       = _env("PROJECT_KEY", "CSHRM")
 VERSIONS_FILTER   = [v.strip() for v in _env("VERSIONS_FILTER", "").split(",") if v.strip()]
 ONLY_UNRELEASED   = _env("ONLY_UNRELEASED", "1") == "1"
 MAX_ISSUES        = int(_env("MAX_ISSUES", "5000"))
+ENABLE_LINK_HIERARCHY = _env("ENABLE_LINK_HIERARCHY", "1") == "1"
 
 if not PROJECT_KEY:
     raise SystemExit("PROJECT_KEY не задан. Укажи ключ проекта, например PROJECT_KEY=CSHRM")
@@ -74,11 +70,14 @@ OUT_DIR = Path.cwd() / "release_export"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= Утилиты Excel =========
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 # Имя листа Excel максимум 31 символ
 # Пример: make_sheet_name("CSHRM 2025.10", "Tree") → "CSHRM 2025.10_Tree" (усечёт базу при необходимости)
 def make_sheet_name(base: str, suffix: str) -> str:
-    safe = re.sub(r'[:\\/?*\[\]]', '_', str(base or 'Release'))
+    safe = re.sub(r'[:\/?*\[\]]', '_', str(base or 'Release'))
     max_base = 31 - (len(suffix) + 1)  # +1 под подчёркивание
     if max_base < 1:
         max_base = 1
@@ -113,16 +112,17 @@ def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = N
     except Exception as e:
         print(f"[autofit] пропущено: {e}")
 
+# ========= Jira helpers =========
+
 def hyperlink_formula(key: str) -> str:
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
     return f'=HYPERLINK("{JIRA_URL}/browse/{k}","{k}")'
 
-# ========= Jira helpers =========
-
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+
 
 def jira_get(url: str, params: Optional[dict] = None) -> dict:
     r = SESSION.get(url, params=params, timeout=60)
@@ -130,11 +130,13 @@ def jira_get(url: str, params: Optional[dict] = None) -> dict:
         raise RuntimeError(f"GET {url} → {r.status_code}: {r.text[:500]}")
     return r.json()
 
+
 def jira_post(url: str, payload: dict) -> dict:
     r = SESSION.post(url, json=payload, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"POST {url} → {r.status_code}: {r.text[:500]}")
     return r.json()
+
 
 def get_field_ids() -> Dict[str, str]:
     """Возвращает id кастом-полей для Epic Link и Story Points."""
@@ -149,6 +151,7 @@ def get_field_ids() -> Dict[str, str]:
         if name == "story points":
             story_points_id = fid
     return {"epic_link": epic_link_id, "story_points": story_points_id}
+
 
 def list_versions(project_key: str) -> List[dict]:
     if not project_key or str(project_key).strip().lower() in {"none", "null", "-", "—", "–"}:
@@ -169,11 +172,11 @@ def list_versions(project_key: str) -> List[dict]:
             "releaseDate": v.get("releaseDate"),
             "overdue": v.get("overdue"),
         })
-    # сортировка: по дате (пустые в конец), затем по имени
     out.sort(key=lambda x: (x.get("releaseDate") is None, x.get("releaseDate") or "9999-12-31", str(x.get("name") or "")))
     if not out:
         print("[warn] Версии не найдены по заданным фильтрам. Попробуй снять ONLY_UNRELEASED или задать VERSIONS_FILTER.")
     return out
+
 
 def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dict]:
     url = f"{JIRA_URL}/rest/api/2/search"
@@ -188,16 +191,24 @@ def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dic
         }
         data = jira_post(url, payload)
         issues.extend(data.get("issues", []))
-        fetched = len(data.get("issues", []))
-        start_at += fetched
-        if start_at >= data.get("total", 0) or start_at >= max_results or fetched == 0:
+        start_at += len(data.get("issues", []))
+        if start_at >= data.get("total", 0) or start_at >= max_results:
             break
     return issues
 
 # ========= Построение иерархии =========
 
+# Правила "виртуальной" иерархии по ссылкам: parent_type → child_type (case-insensitive)
+LINK_HIERARCHY_RULES = [
+    ("engineering concept", "change request"),
+    ("support", "bugfix"),
+]
+
+
 def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Строит иерархию и таблицу связей для заданного релиза."""
+    """Строит иерархию и таблицу связей для заданного релиза.
+    Дополнительно: если ENABLE_LINK_HIERARCHY=1 — создаёт виртуальные связи parent→child по типам задач согласно LINK_HIERARCHY_RULES.
+    """
     by_key = {i.get("key"): i for i in issues}
 
     def _g(obj, path: List[str]):
@@ -215,40 +226,51 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
 
     # связи
     links_rows: List[dict] = []
+    link_pairs: List[Tuple[str, str]] = []
+
+    def issue_type_name(i: dict) -> str:
+        return _g(i.get("fields", {}), ["issuetype", "name"]) or ""
 
     for k, it in by_key.items():
         fields = it.get("fields", {})
-        # parent/subtasks
         parent = _g(fields, ["parent", "key"]) or None
         parent_map[k] = parent
         if parent:
             children.setdefault(parent, []).append(k)
-        # epic link
         epic = fields.get(epic_link_field) if epic_link_field else None
         if isinstance(epic, dict):
             epic = epic.get("key")
         epic_of[k] = epic
         if epic:
             epic_children.setdefault(epic, []).append(k)
-
-        # issue links
         for l in fields.get("issuelinks") or []:
             ltype = _g(l, ["type", "name"]) or ""
             inward = _g(l, ["inwardIssue", "key"]) or None
             outward = _g(l, ["outwardIssue", "key"]) or None
             if inward:
                 links_rows.append({"From": k, "Direction": "inward", "Type": ltype, "To": inward})
+                link_pairs.append((k, inward))
             if outward:
                 links_rows.append({"From": k, "Direction": "outward", "Type": ltype, "To": outward})
+                link_pairs.append((k, outward))
 
-    def issue_type_name(i: dict) -> str:
-        return _g(i.get("fields", {}), ["issuetype", "name"]) or ""
+    if ENABLE_LINK_HIERARCHY and LINK_HIERARCHY_RULES:
+        rules = [(a.lower(), b.lower()) for a, b in LINK_HIERARCHY_RULES]
+        for a, b in link_pairs:
+            ia = by_key.get(a); ib = by_key.get(b)
+            if not ia or not ib:
+                continue
+            ta = issue_type_name(ia).lower(); tb = issue_type_name(ib).lower()
+            if (ta, tb) in rules:
+                if not parent_map.get(b) and not epic_of.get(b):
+                    parent_map[b] = a
+                    children.setdefault(a, []).append(b)
+            if (tb, ta) in rules:
+                if not parent_map.get(a) and not epic_of.get(a):
+                    parent_map[a] = b
+                    children.setdefault(b, []).append(a)
 
-    def is_epic(i: dict) -> bool:
-        return issue_type_name(i).lower() == "epic"
-
-    # корневые группы
-    epics = [k for k, it in by_key.items() if is_epic(it)]
+    epics = [k for k, it in by_key.items() if issue_type_name(it).lower() == "epic"]
     roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
 
     def row_from_key(key: str, level: int, rel_name: str) -> dict:
@@ -297,14 +319,11 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         for ch in children.get(key, []):
             walk_issue(ch, level + 1)
 
-    # 1) Эпики
     for e in sorted(epics):
         rows.append(row_from_key(e, 0, release_name))
-        for k in sorted(set(epic_children.get(e, []))):
-            # если у story есть родитель не-эпик — всё равно обойдём деревом parent
+        for k in sorted(set(children.get(e, []) + epic_children.get(e, []))):
             walk_issue(k, 1)
 
-    # 2) Без эпика и без родителя — верхний уровень
     if roots_wo_epic:
         rows.append({
             "Release": release_name,
@@ -336,10 +355,11 @@ FIELDS_CACHE = None
 EPIC_LINK_FIELD_ID = None
 STORY_POINTS_FIELD_ID = None
 
+
 def main():
     global FIELDS_CACHE, EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID
 
-    # Диагностика настроек перед стартом
+    # Диагностика настроек перед стартом — сразу видно, что мы реально используем
     print("=== Release Composer: старт ===")
     print(f"JIRA_URL        : {JIRA_URL}")
     print(f"PROJECT_KEY     : {PROJECT_KEY}")
@@ -358,7 +378,6 @@ def main():
     if not EPIC_LINK_FIELD_ID:
         print("[warn] Не нашёл id 'Epic Link' — иерархия может быть неполной")
 
-    # Какие поля запрашиваем
     fields = [
         "summary", "issuetype", "status", "assignee", "parent",
         "subtasks", "issuelinks", "priority", "fixVersions", "created", "updated",
@@ -368,52 +387,53 @@ def main():
     if STORY_POINTS_FIELD_ID:
         fields.append(STORY_POINTS_FIELD_ID)
 
-    writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+    per_release = []
     overview_rows: List[pd.DataFrame] = []
 
+    for v in versions:
+        vname = v.get("name")
+        print(f"→ Версия: {vname}")
+        jql = f'project={PROJECT_KEY} AND fixVersion="{vname}" ORDER BY issuetype, key'
+        issues = jql_search(jql, fields, max_results=MAX_ISSUES)
+        if not issues:
+            print("  (нет задач)")
+            continue
+        tmp = []
+        for it in issues:
+            f = it.get("fields", {})
+            tmp.append({
+                "Release": vname,
+                "Тип": (f.get("issuetype") or {}).get("name"),
+                "Статус": (f.get("status") or {}).get("name"),
+                "Ключ": it.get("key"),
+            })
+        ov = pd.DataFrame(tmp)
+        overview_rows.append(ov)
+        tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
+        tree_cols = [
+            "Release","Level","Нода","Ключ","Ссылка","Тип","Статус","Исполнитель",
+            "Story Points","Epic","Родитель","Priority","Fix Version(s)","Created","Updated"
+        ]
+        tree_df = tree_df[tree_cols]
+        per_release.append((vname, tree_df, links_df, ov))
+
+    if not per_release:
+        raise SystemExit("Нет задач ни в одной из подходящих версий")
+
+    all_tree = pd.concat([tr for _, tr, _, _ in per_release], ignore_index=True)
+
+    writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
     with pd.ExcelWriter(writer_path, engine="openpyxl") as xw:
+        all_tree.to_excel(xw, index=False, sheet_name="Hierarchy")
+        ws_h: Worksheet = xw.sheets["Hierarchy"]
+        ws_h.auto_filter.ref = ws_h.dimensions
+        ws_h.freeze_panes = "A2"
 
-        for v in versions:
-            vname = v.get("name")
-            print(f"→ Версия: {vname}")
-            jql = f'project={PROJECT_KEY} AND fixVersion="{vname}" ORDER BY issuetype, key'
-            issues = jql_search(jql, fields, max_results=MAX_ISSUES)
-            if not issues:
-                print("  (нет задач)")
-                continue
-
-            # Сводка по типам/статусам
-            tmp = []
-            for it in issues:
-                f = it.get("fields", {})
-                tmp.append({
-                    "Release": vname,
-                    "Тип": (f.get("issuetype") or {}).get("name"),
-                    "Статус": (f.get("status") or {}).get("name"),
-                    "Ключ": it.get("key"),
-                })
-            ov = pd.DataFrame(tmp)
-            overview_rows.append(ov)
-
-            # Иерархия
-            tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
-
-            # Порядок колонок
-            tree_cols = [
-                "Release","Level","Нода","Ключ","Ссылка","Тип","Статус","Исполнитель",
-                "Story Points","Epic","Родитель","Priority","Fix Version(s)","Created","Updated"
-            ]
-            tree_df = tree_df[tree_cols]
-
-            # Создание листа для дерева
+        for vname, tree_df, links_df, _ov in per_release:
             sheet_tree = make_sheet_name(vname, "Tree")
             tree_df.to_excel(xw, index=False, sheet_name=sheet_tree)
-
-            # Получаем сам лист openpyxl
             ws: Worksheet = xw.sheets[sheet_tree]
-
-            # Уровни группировки строк
-            for i in range(2, ws.max_row + 1):  # без заголовка
+            for i in range(2, ws.max_row + 1):
                 try:
                     level_val = tree_df.iloc[i - 2]["Level"] or 0
                 except Exception:
@@ -424,7 +444,6 @@ def main():
             ws.auto_filter.ref = ws.dimensions
             ws.freeze_panes = "A2"
 
-            # Связи задач
             if not links_df.empty:
                 sheet_links = make_sheet_name(vname, "Links")
                 links_df.to_excel(xw, index=False, sheet_name=sheet_links)
@@ -432,12 +451,11 @@ def main():
                 ws2.auto_filter.ref = ws2.dimensions
                 ws2.freeze_panes = "A2"
 
-        # Итоговый Overview
         if overview_rows:
             overview = pd.concat(overview_rows, ignore_index=True)
             pivot = pd.pivot_table(
                 overview,
-                index=["Release", "Тип"],
+                index=["Release","Тип"],
                 columns=["Статус"],
                 values="Ключ",
                 aggfunc="count",
@@ -449,7 +467,6 @@ def main():
             ws_ov.auto_filter.ref = ws_ov.dimensions
             ws_ov.freeze_panes = "A2"
 
-    # Автофит ширины
     excel_autofit_smart(writer_path, width_overrides={
         "Нода": 60,
         "Ссылка": 16,
@@ -459,6 +476,7 @@ def main():
     })
 
     print(f"Готово → {writer_path}")
+
 
 if __name__ == "__main__":
     # Поддержка запуска из консоли с параметрами: python Release.py CSHRM "Rel 2025.10"

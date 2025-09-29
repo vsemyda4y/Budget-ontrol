@@ -411,8 +411,8 @@ def main():
         overview_rows.append(ov)
         tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
         tree_cols = [
-            "Release","Level","Нода","Ключ","Ссылка","Тип","Статус","Исполнитель",
-            "Story Points","Epic","Родитель","Priority","Fix Version(s)","Created","Updated"
+            "Level","Нода","Ссылка","Тип","Статус","Исполнитель",
+            "Story Points","Priority","Fix Version(s)","Created","Updated"
         ]
         tree_df = tree_df[tree_cols]
         per_release.append((vname, tree_df, links_df, ov))

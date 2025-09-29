@@ -1,8 +1,2 @@
-C:\Users\zaytsev_ra2\PycharmProjects\TCO\venv\lib\site-packages\openpyxl\workbook\child.py:99: UserWarning: Title is more than 31 characters. Some applications may not be able to read the file
-  warnings.warn("Title is more than 31 characters. Some applications may not be able to read the file")
-Traceback (most recent call last):
-  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 434, in <module>
-    main()
-  File "C:\Users\zaytsev_ra2\PycharmProjects\TCO\Release.py", line 384, in main
-    ws = xw.sheets[f"{vname[:28]}_Tree"]._worksheet  # type: Worksheet
-AttributeError: 'Worksheet' object has no attribute '_worksheet'
+ ws: Worksheet = xw.sheets[sheet_tree]
+IndentationError: unexpected indent

@@ -13,6 +13,7 @@ Release Composer — выгрузка состава релизов по код�
 - ENABLE_LINK_HIERARCHY  — "1" → строить виртуальную иерархию по линкам (см. LINK_HIERARCHY_RULES), по умолчанию "1"
 - CONFLUENCE_HOST        — подстрока хоста Confluence для поиска артефакта в remotelink (по умолчанию "confluence")
 - RELEASE_NOTE_FIELD_ID  — (опц.) явный id кастомного поля для Release Note (например, customfield_12345)
+- SERVICE_FIELD_ID       — (опц.) явный id кастомного поля для Service/Услуга
 - COLLAPSE_LEVEL         — уровень, выше которого строки будут скрыты при открытии (по умолчанию 1 → скрывать Level>=2)
 
 Выходной Excel:
@@ -20,7 +21,7 @@ Release Composer — выгрузка состава релизов по код�
 - Overview — сводная по типам/статусам (оставлено; скажешь — уберу).
 
 Колонки на листах ..._Tree:
-Level, Блок, Краткое содержание, Ссылка, Артефакт, Release Note, Тип, Статус, Исполнитель, Story Points, Priority, Fix Version(s), Created, Updated
+Level, Блок, Услуга, Краткое содержание, Задача, Артефакт, Release Note, Тип, Статус, Исполнитель, Story Points, Priority, Fix Version(s), Created, Updated
 """
 
 import os
@@ -57,6 +58,7 @@ MAX_ISSUES             = int(_env("MAX_ISSUES", "5000"))
 ENABLE_LINK_HIERARCHY  = _env("ENABLE_LINK_HIERARCHY", "1") == "1"
 CONFLUENCE_HOST        = _env("CONFLUENCE_HOST", "confluence")
 RELEASE_NOTE_FIELD_ID  = _env("RELEASE_NOTE_FIELD_ID", "")
+SERVICE_FIELD_ID       = _env("SERVICE_FIELD_ID", "")
 COLLAPSE_LEVEL         = int(_env("COLLAPSE_LEVEL", "1"))
 
 if not PROJECT_KEY:
@@ -144,6 +146,20 @@ def apply_wrap(ws: Worksheet, headers_to_wrap: List[str], header_row_idx: int):
             cell = row[0]
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
+def align_top(ws: Worksheet, headers_to_align: List[str], header_row_idx: int):
+    """Только выравнивание по верхнему краю (без переноса)."""
+    header_to_col: Dict[str, int] = {}
+    for cell in ws[header_row_idx]:
+        if cell.value:
+            header_to_col[str(cell.value).strip()] = cell.column
+    for h in headers_to_align:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=header_row_idx, max_row=ws.max_row, min_col=col, max_col=col):
+            cell = row[0]
+            cell.alignment = Alignment(vertical="top")
+
 def apply_row_styles(ws: Worksheet, header_row_idx: int):
     """Подсветка строк по блоку и жирный шрифт для верхнего уровня."""
     headers = {str(c.value).strip(): c.column for c in ws[header_row_idx] if c.value}
@@ -202,12 +218,14 @@ def jira_post(url: str, payload: dict) -> dict:
     return r.json()
 
 def get_field_ids() -> Dict[str, str]:
-    """Возвращает id кастом-полей для Epic Link, Story Points и Release Note (если есть)."""
+    """Возвращает id кастом-полей для Epic Link, Story Points, Release Note и Service/Услуга (если есть)."""
     fields = jira_get(f"{JIRA_URL}/rest/api/2/field")
     epic_link_id = None
     story_points_id = None
     release_note_id = RELEASE_NOTE_FIELD_ID or None  # явный приоритет
+    service_id = SERVICE_FIELD_ID or None           # явный приоритет
     rn_synonyms = {"release note", "release notes", "релизные заметки", "релиз нота", "релиз-нота"}
+    service_synonyms = {"service", "услуга"}
     for f in fields:
         name = (f.get("name") or "").strip().lower()
         fid = f.get("id")
@@ -217,7 +235,10 @@ def get_field_ids() -> Dict[str, str]:
             story_points_id = fid
         if not release_note_id and name in rn_synonyms:
             release_note_id = fid
-    return {"epic_link": epic_link_id, "story_points": story_points_id, "release_note": release_note_id}
+        if not service_id and name in service_synonyms:
+            service_id = fid
+    return {"epic_link": epic_link_id, "story_points": story_points_id,
+            "release_note": release_note_id, "service": service_id}
 
 def list_versions(project_key: str) -> List[dict]:
     if not project_key or str(project_key).strip().lower() in {"none", "null", "-", "—", "–"}:
@@ -303,6 +324,7 @@ def _block_by_type(issue_type: str) -> str:
 EPIC_LINK_FIELD_ID: Optional[str] = None
 STORY_POINTS_FIELD_ID: Optional[str] = None
 RELEASE_NOTE_FIELD_ID_RESOLVED: Optional[str] = None
+SERVICE_FIELD_ID_RESOLVED: Optional[str] = None
 
 def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Строит иерархию и таблицу связей для заданного релиза.
@@ -397,6 +419,13 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
     epics = [k for k, it in by_key.items() if issue_type_name(it).lower() == "epic"]
     roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
 
+    def _extract_field_value(raw):
+        if isinstance(raw, dict):
+            return str(raw.get("value") or raw.get("name") or raw.get("displayName") or "")
+        if isinstance(raw, list):
+            return ", ".join(str(x.get("value") if isinstance(x, dict) else x) for x in raw if x not in (None, ""))
+        return "" if raw is None else str(raw)
+
     def row_from_key(key: str, level: int, rel_name: str, prefix: str) -> dict:
         it = by_key[key]
         f = it.get("fields", {})
@@ -408,18 +437,9 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         updated = _g(f, ["updated"]) or ""
         summary = f.get("summary") or ""
         # Release Note
-        release_note = ""
-        try:
-            if RELEASE_NOTE_FIELD_ID_RESOLVED:
-                rn_val = f.get(RELEASE_NOTE_FIELD_ID_RESOLVED)
-                if isinstance(rn_val, dict):
-                    release_note = str(rn_val.get("value") or rn_val.get("name") or rn_val.get("displayName") or "")
-                elif isinstance(rn_val, list):
-                    release_note = ", ".join(str(x.get("value") if isinstance(x, dict) else x) for x in rn_val if x not in (None, ""))
-                elif rn_val is not None:
-                    release_note = str(rn_val)
-        except Exception:
-            release_note = ""
+        release_note = _extract_field_value(f.get(RELEASE_NOTE_FIELD_ID_RESOLVED)) if RELEASE_NOTE_FIELD_ID_RESOLVED else ""
+        # Service / Услуга
+        service_val = _extract_field_value(f.get(SERVICE_FIELD_ID_RESOLVED)) if SERVICE_FIELD_ID_RESOLVED else ""
         sp_raw = f.get(STORY_POINTS_FIELD_ID) if STORY_POINTS_FIELD_ID else None
         if isinstance(sp_raw, (int, float)):
             story_points = sp_raw
@@ -434,8 +454,9 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             "Release": rel_name,  # тех. поле (в Excel не выводим)
             "Level": level,
             "Блок": block,
+            "Услуга": service_val,
             "Краткое содержание": prefix + summary,
-            "Ссылка": hyperlink_formula(key),
+            "Задача": hyperlink_formula(key),
             "Артефакт": artifact_for(key),
             "Release Note": release_note,
             "Тип": issue_type,
@@ -475,8 +496,9 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             "Release": release_name,
             "Level": 0,
             "Блок": "",
+            "Услуга": "",
             "Краткое содержание": "(без эпика)",
-            "Ссылка": "",
+            "Задача": "",
             "Артефакт": "",
             "Release Note": "",
             "Тип": "",
@@ -499,7 +521,7 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
 # ========= Основной сценарий =========
 
 def main():
-    global EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID, RELEASE_NOTE_FIELD_ID_RESOLVED
+    global EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID, RELEASE_NOTE_FIELD_ID_RESOLVED, SERVICE_FIELD_ID_RESOLVED
 
     print("=== Release Composer: старт ===")
     print(f"JIRA_URL               : {JIRA_URL}")
@@ -519,10 +541,14 @@ def main():
     EPIC_LINK_FIELD_ID = ids.get("epic_link")
     STORY_POINTS_FIELD_ID = ids.get("story_points")
     RELEASE_NOTE_FIELD_ID_RESOLVED = ids.get("release_note")
+    SERVICE_FIELD_ID_RESOLVED = ids.get("service")
     if not EPIC_LINK_FIELD_ID:
         print("[warn] Не нашёл id 'Epic Link' — иерархия может быть неполной")
-    if RELEASE_NOTE_FIELD_ID and RELEASE_NOTE_FIELD_ID != RELEASE_NOTE_FIELD_ID_RESOLVED:
-        RELEASE_NOTE_FIELD_ID_RESOLVED = RELEASE_NOTE_FIELD_ID  # явное важнее
+    # приоритет явных ID из ENV
+    if RELEASE_NOTE_FIELD_ID:
+        RELEASE_NOTE_FIELD_ID_RESOLVED = RELEASE_NOTE_FIELD_ID
+    if SERVICE_FIELD_ID:
+        SERVICE_FIELD_ID_RESOLVED = SERVICE_FIELD_ID
 
     # Поля для загрузки
     fields = [
@@ -535,6 +561,8 @@ def main():
         fields.append(STORY_POINTS_FIELD_ID)
     if RELEASE_NOTE_FIELD_ID_RESOLVED:
         fields.append(RELEASE_NOTE_FIELD_ID_RESOLVED)
+    if SERVICE_FIELD_ID_RESOLVED:
+        fields.append(SERVICE_FIELD_ID_RESOLVED)
 
     per_release = []  # [(vname, tree_df, links_df, ov_df)]
     overview_rows: List[pd.DataFrame] = []
@@ -563,9 +591,9 @@ def main():
 
         # Иерархия
         tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
-        # Итоговые колонки для выдачи (перенёс Блок сразу после Level)
+        # Итоговые колонки для выдачи (Блок сразу после Level, Задача вместо «Ссылка», добавлена «Услуга»)
         tree_cols = [
-            "Level", "Блок", "Краткое содержание", "Ссылка", "Артефакт", "Release Note",
+            "Level", "Блок", "Услуга", "Краткое содержание", "Задача", "Артефакт", "Release Note",
             "Тип", "Статус", "Исполнитель", "Story Points", "Priority",
             "Fix Version(s)", "Created", "Updated"
         ]
@@ -608,6 +636,8 @@ def main():
 
             # Перенос строк и стили
             apply_wrap(ws, ["Краткое содержание", "Release Note"], header_row_idx=2)
+            # Выровнять «Задача» по верхнему краю
+            align_top(ws, ["Задача"], header_row_idx=2)
             apply_row_styles(ws, header_row_idx=2)
 
         # Сводная Overview (если нужна аналитика)
@@ -630,8 +660,9 @@ def main():
     # Автофит ширины листов (понимает, что заголовок на строке 2)
     excel_autofit_smart(writer_path, width_overrides={
         "Блок": 16,
+        "Услуга": 20,
         "Краткое содержание": 60,
-        "Ссылка": 16,
+        "Задача": 16,
         "Артефакт": 40,
         "Release Note": 50,
         "Исполнитель": 28,

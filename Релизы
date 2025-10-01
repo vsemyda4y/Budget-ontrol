@@ -17,7 +17,7 @@ Release Composer — выгрузка состава релизов по код�
 - COLLAPSE_LEVEL         — уровень, выше которого строки будут скрыты при открытии (по умолчанию 1 → скрывать Level>=2)
 
 Выходной Excel:
-- Только листы <Release>_Tree — иерархия для каждой версии, с легендой, цветовой подсветкой блоков и «ёлочкой».
+- Только листы <Release>_Tree — иерархия для каждой версии, с легендой, цветовой подсветкой блоков/уровней, «ёлочкой».
 - Overview — сводная по количеству задач по типам (без статусов).
 
 Колонки на листах ..._Tree (итоговый порядок):
@@ -81,7 +81,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 def make_sheet_name(base: str, suffix: str) -> str:
     """Имя листа ≤31 символ и без недопустимых знаков."""
     safe = re.sub(r'[:\\/?*\[\]]', '_', str(base or 'Release'))
-    max_base = 31 - (len(suffix) + 1)  # +1 под "_"
+    max_base = 31 - (len(suffix) + 1)
     if max_base < 1:
         max_base = 1
     safe = safe[:max_base]
@@ -98,7 +98,7 @@ def _visible_text(val: object) -> str:
 
 def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = None,
                         clamp_min: int = 6, clamp_max: int = 60):
-    """Автофит с поддержкой «легенды» на первой строке: ищем строку заголовков (там где есть 'Level')."""
+    """Автофит по всему файлу; корректно ищет строку заголовков (учитывает легенду)."""
     try:
         wb = load_workbook(path)
         for ws in wb.worksheets:
@@ -106,12 +106,12 @@ def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = N
             header_row_idx = 1
             for r in range(1, min(6, ws.max_row + 1)):
                 vals = [str(c.value).strip() if c.value else "" for c in ws[r]]
-                if "Level" in vals:
+                if "Level" in vals or "Release" in vals:
                     header_row_idx = r
                     break
             # собрать заголовки
             headers = {cell.column: (cell.value or "") for cell in ws[header_row_idx]}
-            # пройтись по колонкам, начиная с header_row_idx
+            # пройтись по колонкам
             for col_cells in ws.iter_cols(min_col=1, max_col=ws.max_column,
                                           min_row=header_row_idx, max_row=ws.max_row):
                 col_idx = col_cells[0].column
@@ -133,7 +133,7 @@ def hyperlink_formula(key: str) -> str:
     return f'=HYPERLINK("{JIRA_URL}/browse/{k}","{k}")'
 
 def apply_wrap(ws: Worksheet, headers_to_wrap: List[str], header_row_idx: int):
-    """Включить перенос строк и выравнивание по верхнему краю для заданных колонок по имени заголовка."""
+    """Перенос строк и выравнивание по верхнему краю для заданных колонок."""
     header_to_col: Dict[str, int] = {}
     for cell in ws[header_row_idx]:
         if cell.value:
@@ -157,15 +157,16 @@ def align_top_all(ws: Worksheet, header_row_idx: int):
             )
 
 def apply_row_styles(ws: Worksheet, header_row_idx: int):
-    """Подсветка строк: блоки + специальный цвет для Level=2; жирный шрифт для Level=0."""
+    """Подсветка строк: блоки + специальный цвет для Level=1 и Level=2; жирный шрифт для Level=0."""
     headers = {str(c.value).strip(): c.column for c in ws[header_row_idx] if c.value}
     col_level = headers.get("Level")
     col_block = headers.get("Блок")
     if not col_level:
         return
-    fill_dev = PatternFill(fill_type="solid", fgColor="E6F2FF")  # Развитие — голубой
-    fill_sup = PatternFill(fill_type="solid", fgColor="FFF2CC")  # Сопровождение — жёлтый
-    fill_lvl2 = PatternFill(fill_type="solid", fgColor="E8F5E9") # Level 2 — светло-зелёный
+    fill_dev  = PatternFill(fill_type="solid", fgColor="E6F2FF")  # Развитие — голубой
+    fill_sup  = PatternFill(fill_type="solid", fgColor="FFF2CC")  # Сопровождение — жёлтый
+    fill_lvl1 = PatternFill(fill_type="solid", fgColor="E8F5E9")  # Level 1 — светло-зелёный
+    fill_lvl2 = PatternFill(fill_type="solid", fgColor="FFE0B2")  # Level 2 — светло-оранжевый
 
     for i in range(header_row_idx + 1, ws.max_row + 1):
         # level
@@ -186,8 +187,10 @@ def apply_row_styles(ws: Worksheet, header_row_idx: int):
             block = str(ws.cell(row=i, column=col_block).value or "").strip().lower()
             row_fill = fill_dev if block == "развитие" else fill_sup if block == "сопровождение" else None
 
-        # приоритетная заливка уровня 2
-        if level == 2:
+        # приоритетные заливки по уровню
+        if level == 1:
+            row_fill = fill_lvl1
+        elif level == 2:
             row_fill = fill_lvl2
 
         if row_fill:
@@ -310,7 +313,6 @@ def get_confluence_artifact(issue_key: str) -> str:
     return ""
 
 # ========= Иерархия по линкам =========
-# parent_type → child_type (case-insensitive)
 LINK_HIERARCHY_RULES = [
     ("engineering concept", "change request"),
     ("support", "bugfix"),
@@ -357,19 +359,16 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
 
     for k, it in by_key.items():
         fields = it.get("fields", {})
-        # parent/subtasks
         parent = _g(fields, ["parent", "key"]) or None
         parent_map[k] = parent
         if parent:
             children.setdefault(parent, []).append(k)
-        # epic link
         epic = fields.get(epic_link_field) if epic_link_field else None
         if isinstance(epic, dict):
             epic = epic.get("key")
         epic_of[k] = epic
         if epic:
             epic_children.setdefault(epic, []).append(k)
-        # issue links (собираем пары)
         for l in fields.get("issuelinks") or []:
             ltype = _g(l, ["type", "name"]) or ""
             inward = _g(l, ["inwardIssue", "key"]) or None
@@ -381,14 +380,13 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
                 links_rows.append({"From": k, "Direction": "outward", "Type": ltype, "To": outward})
                 link_pairs.append((k, outward))
 
-    # Кеш Confluence-артефактов
     _artifact_cache: Dict[str, str] = {}
     def artifact_for(key: str) -> str:
         if key not in _artifact_cache:
             _artifact_cache[key] = get_confluence_artifact(key)
         return _artifact_cache[key]
 
-    # Виртуальная иерархия по ссылкам (если включена)
+    # виртуальная иерархия
     if ENABLE_LINK_HIERARCHY and LINK_HIERARCHY_RULES:
         rules = [(a.lower(), b.lower()) for a, b in LINK_HIERARCHY_RULES]
         for a, b in link_pairs:
@@ -396,27 +394,23 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             if not ia or not ib:
                 continue
             ta = issue_type_name(ia).lower(); tb = issue_type_name(ib).lower()
-            if (ta, tb) in rules:
-                if not parent_map.get(b) and not epic_of.get(b):
-                    parent_map[b] = a
-                    children.setdefault(a, []).append(b)
-            if (tb, ta) in rules:
-                if not parent_map.get(a) and not epic_of.get(a):
-                    parent_map[a] = b
-                    children.setdefault(b, []).append(a)
+            if (ta, tb) in rules and not parent_map.get(b) and not epic_of.get(b):
+                parent_map[b] = a
+                children.setdefault(a, []).append(b)
+            if (tb, ta) in rules and not parent_map.get(a) and not epic_of.get(a):
+                parent_map[a] = b
+                children.setdefault(b, []).append(a)
 
-    # helpers для «ёлочки»
     def _tree_prefix(prefix_last_flags: List[bool], is_last: Optional[bool]) -> str:
         if not prefix_last_flags and is_last is None:
             return ""
-        s_parts: List[str] = []
+        parts: List[str] = []
         for last in prefix_last_flags:
-            s_parts.append("   " if last else "│  ")
+            parts.append("   " if last else "│  ")
         if is_last is not None:
-            s_parts.append("└─ " if is_last else "├─ ")
-        return "".join(s_parts)
+            parts.append("└─ " if is_last else "├─ ")
+        return "".join(parts)
 
-    # корневые группы
     epics = [k for k, it in by_key.items() if issue_type_name(it).lower() == "epic"]
     roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
 
@@ -432,15 +426,14 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         f = it.get("fields", {})
         assignee = _g(f, ["assignee", "displayName"]) or ""
         status = _g(f, ["status", "name"]) or ""
-        issue_type = issue_type_name(it)
+        issue_type = _g(f, ["issuetype", "name"]) or ""
         summary = f.get("summary") or ""
-        # Release Note / Service
         release_note = _extract_field_value(f.get(RELEASE_NOTE_FIELD_ID_RESOLVED)) if RELEASE_NOTE_FIELD_ID_RESOLVED else ""
         service_val  = _extract_field_value(f.get(SERVICE_FIELD_ID_RESOLVED)) if SERVICE_FIELD_ID_RESOLVED else ""
         fix_versions = ", ".join((v.get("name") for v in (f.get("fixVersions") or [])))
         block = _block_by_type(issue_type)
         return {
-            "Release": rel_name,  # тех. поле (в Excel не выводим)
+            "Release": rel_name,
             "Level": level,
             "Блок": block,
             "Краткое содержание": prefix + summary,
@@ -467,7 +460,6 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             last = (idx == len(kids) - 1)
             walk_issue(ch, level + 1, prefix_flags + [is_last if is_last is not None else True], last)
 
-    # 1) Эпики → их дети
     for e in sorted(epics):
         rows.append(row_from_key(e, 0, release_name, prefix=""))
         first_level = sorted(set(children.get(e, []) + epic_children.get(e, [])))
@@ -475,7 +467,6 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             last = (idx == len(first_level) - 1)
             walk_issue(k, 1, [], last)
 
-    # 2) Без эпика и без родителя — верхний уровень
     if roots_wo_epic:
         rows.append({
             "Release": release_name,
@@ -512,15 +503,13 @@ def main():
     print(f"ENABLE_LINK_HIERARCHY  : {ENABLE_LINK_HIERARCHY}")
     print(f"CONFLUENCE_HOST        : {CONFLUENCE_HOST}")
 
-    print("→ Получаю список версий...")
     versions = list_versions(PROJECT_KEY)
     if not versions:
         raise SystemExit("Нет подходящих версий (проверь фильтры/права)")
 
-    # Определяем id кастом-полей
     ids = get_field_ids()
     EPIC_LINK_FIELD_ID = ids.get("epic_link")
-    STORY_POINTS_FIELD_ID = ids.get("story_points")  # на будущее
+    STORY_POINTS_FIELD_ID = ids.get("story_points")
     RELEASE_NOTE_FIELD_ID_RESOLVED = ids.get("release_note")
     SERVICE_FIELD_ID_RESOLVED = ids.get("service")
     if not EPIC_LINK_FIELD_ID:
@@ -530,7 +519,6 @@ def main():
     if SERVICE_FIELD_ID:
         SERVICE_FIELD_ID_RESOLVED = SERVICE_FIELD_ID
 
-    # Поля для загрузки
     fields = [
         "summary", "issuetype", "status", "assignee", "parent",
         "subtasks", "issuelinks", "priority", "fixVersions"
@@ -542,7 +530,7 @@ def main():
     if SERVICE_FIELD_ID_RESOLVED:
         fields.append(SERVICE_FIELD_ID_RESOLVED)
 
-    per_release = []  # [(vname, tree_df, links_df, ov_df)]
+    per_release = []
     overview_rows: List[pd.DataFrame] = []
 
     for v in versions:
@@ -554,7 +542,6 @@ def main():
             print("  (нет задач)")
             continue
 
-        # Сводка для Overview
         tmp = []
         for it in issues:
             f = it.get("fields", {})
@@ -566,17 +553,16 @@ def main():
         ov = pd.DataFrame(tmp)
         overview_rows.append(ov)
 
-        # Иерархия
         tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
 
-        # Итоговые колонки для выдачи (и порядок)
+        # Порядок колонок
         tree_cols = [
             "Level", "Блок", "Краткое содержание", "Задача", "Тип", "Статус",
             "Услуга", "Артефакт", "Release Note", "Исполнитель", "Fix Versions"
         ]
         tree_df = tree_df[tree_cols]
 
-        # Сортировка по блоку: Развитие → Сопровождение → прочее (стабильно)
+        # Порядок блоков: Развитие → Сопровождение → прочее
         block_order_map = {"Развитие": 0, "Сопровождение": 1}
         tree_df["_block_order"] = tree_df["Блок"].map(block_order_map).fillna(2)
         tree_df = tree_df.sort_values(by=["_block_order"], kind="stable").drop(columns=["_block_order"])
@@ -588,23 +574,19 @@ def main():
 
     writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
     with pd.ExcelWriter(writer_path, engine="openpyxl") as xw:
-        # Только Tree-вкладки по каждой версии
         for vname, tree_df, links_df, _ov in per_release:
             sheet_tree = make_sheet_name(vname, "Tree")
             tree_df.to_excel(xw, index=False, sheet_name=sheet_tree)
             ws: Worksheet = xw.sheets[sheet_tree]
 
-            # Легенда
-            insert_legend(ws, "Блоки: Развитие — голубой; Сопровождение — жёлтый; Level=2 — светло-зелёный")
+            insert_legend(ws, "Блоки: Развитие — голубой; Сопровождение — жёлтый; Level 1 — светло-зелёный; Level 2 — светло-оранжевый")
 
-            # Фильтр и закрепление (учитываем легенду)
             last_col_letter = get_column_letter(ws.max_column)
             ws.auto_filter.ref = f"A2:{last_col_letter}{ws.max_row}"
             ws.freeze_panes = "A3"
 
-            # Группировка строк по Level + автосворачивание > COLLAPSE_LEVEL
             for df_idx in range(len(tree_df)):
-                excel_row = 3 + df_idx  # 1: легенда, 2: заголовки
+                excel_row = 3 + df_idx
                 try:
                     level_val = int(tree_df.iloc[df_idx]["Level"] or 0)
                 except Exception:
@@ -616,7 +598,6 @@ def main():
             ws.sheet_properties.outlinePr.summaryBelow = True
             ws.sheet_properties.outlinePr.applyStyles = True
 
-            # Перенос в длинных колонках + вертикальное выравнивание во всех
             apply_wrap(ws, ["Краткое содержание", "Release Note"], header_row_idx=2)
             align_top_all(ws, header_row_idx=2)
             apply_row_styles(ws, header_row_idx=2)
@@ -637,9 +618,16 @@ def main():
             ws_ov: Worksheet = xw.sheets["Overview"]
             ws_ov.auto_filter.ref = ws_ov.dimensions
             ws_ov.freeze_panes = "A2"
+            # выравнивание по верхнему краю в Overview
+            for row in ws_ov.iter_rows(min_row=1, max_row=ws_ov.max_row, min_col=1, max_col=ws_ov.max_column):
+                for cell in row:
+                    cell.alignment = Alignment(
+                        wrap_text=cell.alignment.wrap_text,
+                        horizontal=cell.alignment.horizontal,
+                        vertical="top"
+                    )
 
-    # Автофит ширины листов (заголовок на строке 2)
-    # Убраны фиксированные ширины для «Артефакт» и «Исполнитель», чтобы они подбирались автоматически.
+    # Автофит ширины листов (включая Overview)
     excel_autofit_smart(writer_path, width_overrides={
         "Level": 6,
         "Блок": 16,
@@ -657,8 +645,6 @@ def main():
     print(f"Готово → {writer_path}")
 
 if __name__ == "__main__":
-    # Поддержка запуска из консоли:
-    # python Release.py CSHRM "Rel 2025.10"
     import sys
     if len(sys.argv) >= 2:
         pk = sys.argv[1].strip()

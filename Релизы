@@ -3,24 +3,11 @@
 Release Composer — выгрузка состава релизов по коду проекта JIRA
 (эпики → истории/задачи → сабтаски) + связи задач (в т.ч. виртуальная иерархия по типам) → Excel c иерархией.
 
-Переменные окружения (можно задать в коде):
-- JIRA_URL               — базовый URL Jira (например, https://jira.nlmk.com)
-- JIRA_BEARER_TOKEN      — Bearer-токен (можно тот же, что в Worklog_with_summary_labels.py)
-- PROJECT_KEY            — ключ проекта (например, "CSHRM")
-- VERSIONS_FILTER        — имена версий через запятую (FixVersion). Пусто → все подходящие.
-- ONLY_UNRELEASED        — "1" → только unreleased версии; "0" → все (по умолчанию "1")
-- MAX_ISSUES             — защитный лимит задач на одну версию (по умолчанию 5000)
-- ENABLE_LINK_HIERARCHY  — "1" → строить виртуальную иерархию по линкам (см. LINK_HIERARCHY_RULES), по умолчанию "1"
-- CONFLUENCE_HOST        — подстрока хоста Confluence для поиска артефакта в remotelink (по умолчанию "confluence")
-- RELEASE_NOTE_FIELD_ID  — (опц.) явный id кастомного поля для Release Note (например, customfield_12345)
-- SERVICE_FIELD_ID       — (опц.) явный id кастомного поля для Service/Услуга
-- COLLAPSE_LEVEL         — уровень, выше которого строки будут скрыты при открытии (по умолчанию 1 → скрывать Level>=2)
-
 Выходной Excel:
-- Только листы <Release>_Tree — иерархия для каждой версии, с легендой, цветовой подсветкой блоков/уровней, «ёлочкой».
-- Overview — сводная по количеству задач по типам (без статусов).
+- <Release>_Tree — иерархия с «ёлочкой», цветами блоков и уровнями.
+- Overview — 1) количество задач по типам; 2) % покрытия артефактами (кластеризация: L1 + его L2 = 1 задача).
 
-Колонки на листах ..._Tree (итоговый порядок):
+Итоговые колонки ..._Tree:
 Level, Блок, Краткое содержание, Задача, Тип, Статус, Услуга, Артефакт, Release Note, Исполнитель, Fix Versions
 """
 
@@ -40,7 +27,6 @@ from openpyxl.worksheet.worksheet import Worksheet
 # ========= ENV =========
 
 def _env(key: str, default: Optional[str] = None) -> str:
-    """Безопасное чтение переменных окружения с защитой от пустых/None/дефисов."""
     val = os.getenv(key)
     if val is None:
         return default or ""
@@ -62,56 +48,45 @@ SERVICE_FIELD_ID       = _env("SERVICE_FIELD_ID", "")
 COLLAPSE_LEVEL         = int(_env("COLLAPSE_LEVEL", "1"))
 
 if not PROJECT_KEY:
-    raise SystemExit("PROJECT_KEY не задан. Укажи ключ проекта, например PROJECT_KEY=CSHRM")
+    raise SystemExit("PROJECT_KEY не задан.")
 if not JIRA_BEARER_TOKEN:
-    raise SystemExit("ENV JIRA_BEARER_TOKEN/JIRA_TEMPO_TOKEN не задан — нужен Bearer токен Jira.")
+    raise SystemExit("JIRA_BEARER_TOKEN не задан.")
 
-HEADERS = {
-    "Authorization": f"Bearer {JIRA_BEARER_TOKEN}",
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-}
+HEADERS = {"Authorization": f"Bearer {JIRA_BEARER_TOKEN}",
+           "Accept": "application/json",
+           "Content-Type": "application/json"}
 
-# ========= ПАПКИ ВЫХОДА =========
 OUT_DIR = Path.cwd() / "release_export"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ========= Утилиты Excel =========
+# ========= Excel utils =========
 
 def make_sheet_name(base: str, suffix: str) -> str:
-    """Имя листа ≤31 символ и без недопустимых знаков."""
     safe = re.sub(r'[:\\/?*\[\]]', '_', str(base or 'Release'))
     max_base = 31 - (len(suffix) + 1)
-    if max_base < 1:
-        max_base = 1
+    if max_base < 1: max_base = 1
     safe = safe[:max_base]
     return f"{safe}_{suffix}"
 
 def _visible_text(val: object) -> str:
-    if val is None:
-        return ""
+    if val is None: return ""
     s = str(val)
-    if not s.startswith("="):
-        return s
+    if not s.startswith("="): return s
     m = re.match(r'^\s*=\s*HYPERLINK\s*\(\s*"[^"]*"\s*[,;]\s*"([^"]*)"\s*\)\s*$', s, re.IGNORECASE)
     return m.group(1) if m else s
 
 def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = None,
                         clamp_min: int = 6, clamp_max: int = 60):
-    """Автофит по всему файлу; корректно ищет строку заголовков (учитывает легенду)."""
     try:
         wb = load_workbook(path)
         for ws in wb.worksheets:
-            # найти строку заголовка
             header_row_idx = 1
             for r in range(1, min(6, ws.max_row + 1)):
                 vals = [str(c.value).strip() if c.value else "" for c in ws[r]]
                 if "Level" in vals or "Release" in vals:
                     header_row_idx = r
                     break
-            # собрать заголовки
             headers = {cell.column: (cell.value or "") for cell in ws[header_row_idx]}
-            # пройтись по колонкам
             for col_cells in ws.iter_cols(min_col=1, max_col=ws.max_column,
                                           min_row=header_row_idx, max_row=ws.max_row):
                 col_idx = col_cells[0].column
@@ -127,27 +102,22 @@ def excel_autofit_smart(path: Path, width_overrides: Optional[Dict[str,int]] = N
         print(f"[autofit] пропущено: {e}")
 
 def hyperlink_formula(key: str) -> str:
-    if not key:
-        return ""
+    if not key: return ""
     k = str(key).strip().replace('"', '""')
     return f'=HYPERLINK("{JIRA_URL}/browse/{k}","{k}")'
 
 def apply_wrap(ws: Worksheet, headers_to_wrap: List[str], header_row_idx: int):
-    """Перенос строк и выравнивание по верхнему краю для заданных колонок."""
     header_to_col: Dict[str, int] = {}
     for cell in ws[header_row_idx]:
-        if cell.value:
-            header_to_col[str(cell.value).strip()] = cell.column
+        if cell.value: header_to_col[str(cell.value).strip()] = cell.column
     for h in headers_to_wrap:
         col = header_to_col.get(h)
-        if not col:
-            continue
+        if not col: continue
         for row in ws.iter_rows(min_row=header_row_idx, max_row=ws.max_row, min_col=col, max_col=col):
             cell = row[0]
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 def align_top_all(ws: Worksheet, header_row_idx: int):
-    """Выравнивание по верхнему краю для всех колонок (заголовки и данные), без изменения wrap_text."""
     for row in ws.iter_rows(min_row=header_row_idx, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row:
             cell.alignment = Alignment(
@@ -157,48 +127,31 @@ def align_top_all(ws: Worksheet, header_row_idx: int):
             )
 
 def apply_row_styles(ws: Worksheet, header_row_idx: int):
-    """Подсветка строк: блоки + специальный цвет для Level=1 и Level=2; жирный шрифт для Level=0."""
     headers = {str(c.value).strip(): c.column for c in ws[header_row_idx] if c.value}
-    col_level = headers.get("Level")
-    col_block = headers.get("Блок")
-    if not col_level:
-        return
-    fill_dev  = PatternFill(fill_type="solid", fgColor="E6F2FF")  # Развитие — голубой
-    fill_sup  = PatternFill(fill_type="solid", fgColor="FFF2CC")  # Сопровождение — жёлтый
-    fill_lvl1 = PatternFill(fill_type="solid", fgColor="E8F5E9")  # Level 1 — светло-зелёный
-    fill_lvl2 = PatternFill(fill_type="solid", fgColor="FFE0B2")  # Level 2 — светло-оранжевый
+    col_level = headers.get("Level"); col_block = headers.get("Блок")
+    if not col_level: return
+    fill_dev  = PatternFill(fill_type="solid", fgColor="E6F2FF")  # Развитие
+    fill_sup  = PatternFill(fill_type="solid", fgColor="FFF2CC")  # Сопровождение
+    fill_lvl1 = PatternFill(fill_type="solid", fgColor="E8F5E9")  # Level 1 — light green
+    fill_lvl2 = PatternFill(fill_type="solid", fgColor="FFE0B2")  # Level 2 — light orange
 
     for i in range(header_row_idx + 1, ws.max_row + 1):
-        # level
-        try:
-            level_val = ws.cell(row=i, column=col_level).value
-            level = int(level_val or 0)
-        except Exception:
-            level = 0
-
-        # bold для верхнего уровня
+        try: level = int(ws.cell(row=i, column=col_level).value or 0)
+        except Exception: level = 0
         if level == 0:
             for j in range(1, ws.max_column + 1):
                 ws.cell(row=i, column=j).font = Font(bold=True)
-
-        # базовая заливка по блоку
         row_fill = None
         if col_block:
             block = str(ws.cell(row=i, column=col_block).value or "").strip().lower()
             row_fill = fill_dev if block == "развитие" else fill_sup if block == "сопровождение" else None
-
-        # приоритетные заливки по уровню
-        if level == 1:
-            row_fill = fill_lvl1
-        elif level == 2:
-            row_fill = fill_lvl2
-
+        if level == 1: row_fill = fill_lvl1
+        elif level == 2: row_fill = fill_lvl2
         if row_fill:
             for j in range(1, ws.max_column + 1):
                 ws.cell(row=i, column=j).fill = row_fill
 
 def insert_legend(ws: Worksheet, text: str):
-    """Вставить строку-легенду (A1:...1), с серой заливкой и жирным шрифтом."""
     ws.insert_rows(1)
     last_col_letter = get_column_letter(ws.max_column)
     ws.merge_cells(f"A1:{last_col_letter}1")
@@ -226,93 +179,25 @@ def jira_post(url: str, payload: dict) -> dict:
     return r.json()
 
 def get_field_ids() -> Dict[str, str]:
-    """Возвращает id кастом-полей для Epic Link, Story Points, Release Note и Service/Услуга (если есть)."""
     fields = jira_get(f"{JIRA_URL}/rest/api/2/field")
     epic_link_id = None
     story_points_id = None
-    release_note_id = RELEASE_NOTE_FIELD_ID or None  # явный приоритет
-    service_id = SERVICE_FIELD_ID or None           # явный приоритет
+    release_note_id = RELEASE_NOTE_FIELD_ID or None
+    service_id = SERVICE_FIELD_ID or None
     rn_synonyms = {"release note", "release notes", "релизные заметки", "релиз нота", "релиз-нота"}
     service_synonyms = {"service", "услуга"}
     for f in fields:
         name = (f.get("name") or "").strip().lower()
         fid = f.get("id")
-        if name == "epic link":
-            epic_link_id = fid
-        if name == "story points":
-            story_points_id = fid
-        if not release_note_id and name in rn_synonyms:
-            release_note_id = fid
-        if not service_id and name in service_synonyms:
-            service_id = fid
+        if name == "epic link": epic_link_id = fid
+        if name == "story points": story_points_id = fid
+        if not release_note_id and name in rn_synonyms: release_note_id = fid
+        if not service_id and name in service_synonyms: service_id = fid
     return {"epic_link": epic_link_id, "story_points": story_points_id,
             "release_note": release_note_id, "service": service_id}
 
-def list_versions(project_key: str) -> List[dict]:
-    if not project_key or str(project_key).strip().lower() in {"none", "null", "-", "—", "–"}:
-        raise SystemExit("list_versions: пустой PROJECT_KEY — задай PROJECT_KEY=CSHRM (или свой)")
-    versions = jira_get(f"{JIRA_URL}/rest/api/2/project/{project_key}/versions")
-    out = []
-    for v in versions:
-        if VERSIONS_FILTER and v.get("name") not in VERSIONS_FILTER:
-            continue
-        if ONLY_UNRELEASED and v.get("released"):
-            continue
-        if v.get("archived"):
-            continue
-        out.append({
-            "id": v.get("id"),
-            "name": v.get("name"),
-            "released": v.get("released"),
-            "releaseDate": v.get("releaseDate"),
-            "overdue": v.get("overdue"),
-        })
-    out.sort(key=lambda x: (x.get("releaseDate") is None,
-                            x.get("releaseDate") or "9999-12-31",
-                            str(x.get("name") or "")))
-    if not out:
-        print("[warn] Версии не найдены по заданным фильтрам. Попробуй снять ONLY_UNRELEASED или задать VERSIONS_FILTER.")
-    return out
+# ========= Link hierarchy rules =========
 
-def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dict]:
-    url = f"{JIRA_URL}/rest/api/2/search"
-    start_at = 0
-    issues: List[dict] = []
-    while True:
-        payload = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": min(100, max_results - start_at),
-            "fields": fields,
-        }
-        data = jira_post(url, payload)
-        issues.extend(data.get("issues", []))
-        fetched = len(data.get("issues", []))
-        start_at += fetched
-        if start_at >= data.get("total", 0) or start_at >= max_results or fetched == 0:
-            break
-    return issues
-
-def get_confluence_artifact(issue_key: str) -> str:
-    """Возвращает формулу Excel HYPERLINK на первую Confluence-ссылку из remotelink задачи.
-    Если не найдено — пустая строка.
-    """
-    try:
-        arr = jira_get(f"{JIRA_URL}/rest/api/2/issue/{issue_key}/remotelink")
-    except Exception:
-        return ""
-    host = CONFLUENCE_HOST.lower().strip()
-    for rl in arr or []:
-        obj = (rl or {}).get("object") or {}
-        url = (obj.get("url") or "").strip()
-        title = (obj.get("title") or "Confluence").strip()
-        if url and (host in url.lower()):
-            u = url.replace('"', '""')
-            t = title.replace('"', '""')
-            return f'=HYPERLINK("{u}","{t}")'
-    return ""
-
-# ========= Иерархия по линкам =========
 LINK_HIERARCHY_RULES = [
     ("engineering concept", "change request"),
     ("support", "bugfix"),
@@ -320,13 +205,11 @@ LINK_HIERARCHY_RULES = [
 
 def _block_by_type(issue_type: str) -> str:
     t = (issue_type or "").strip().lower()
-    if t in {"engineering concept", "change request"}:
-        return "Развитие"
-    if t in {"support", "bugfix"}:
-        return "Сопровождение"
+    if t in {"engineering concept", "change request"}: return "Развитие"
+    if t in {"support", "bugfix"}: return "Сопровождение"
     return ""
 
-# ========= Построение иерархии =========
+# ========= Tree build =========
 
 EPIC_LINK_FIELD_ID: Optional[str] = None
 STORY_POINTS_FIELD_ID: Optional[str] = None
@@ -334,23 +217,18 @@ RELEASE_NOTE_FIELD_ID_RESOLVED: Optional[str] = None
 SERVICE_FIELD_ID_RESOLVED: Optional[str] = None
 
 def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Строит иерархию и таблицу связей для заданного релиза."""
     by_key = {i.get("key"): i for i in issues}
 
     def _g(obj, path: List[str]):
         for p in path:
-            if obj is None:
-                return None
+            if obj is None: return None
             obj = obj.get(p) if isinstance(obj, dict) else None
         return obj
 
-    # индексы
     children: Dict[str, List[str]] = {}
     epic_children: Dict[str, List[str]] = {}
     parent_map: Dict[str, Optional[str]] = {}
     epic_of: Dict[str, Optional[str]] = {}
-
-    # связи
     links_rows: List[dict] = []
     link_pairs: List[Tuple[str, str]] = []
 
@@ -358,18 +236,15 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         return _g(i.get("fields", {}), ["issuetype", "name"]) or ""
 
     for k, it in by_key.items():
-        fields = it.get("fields", {})
-        parent = _g(fields, ["parent", "key"]) or None
+        f = it.get("fields", {})
+        parent = _g(f, ["parent", "key"]) or None
         parent_map[k] = parent
-        if parent:
-            children.setdefault(parent, []).append(k)
-        epic = fields.get(epic_link_field) if epic_link_field else None
-        if isinstance(epic, dict):
-            epic = epic.get("key")
+        if parent: children.setdefault(parent, []).append(k)
+        epic = f.get(epic_link_field) if epic_link_field else None
+        if isinstance(epic, dict): epic = epic.get("key")
         epic_of[k] = epic
-        if epic:
-            epic_children.setdefault(epic, []).append(k)
-        for l in fields.get("issuelinks") or []:
+        if epic: epic_children.setdefault(epic, []).append(k)
+        for l in f.get("issuelinks") or []:
             ltype = _g(l, ["type", "name"]) or ""
             inward = _g(l, ["inwardIssue", "key"]) or None
             outward = _g(l, ["outwardIssue", "key"]) or None
@@ -380,50 +255,58 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
                 links_rows.append({"From": k, "Direction": "outward", "Type": ltype, "To": outward})
                 link_pairs.append((k, outward))
 
-    _artifact_cache: Dict[str, str] = {}
-    def artifact_for(key: str) -> str:
-        if key not in _artifact_cache:
-            _artifact_cache[key] = get_confluence_artifact(key)
-        return _artifact_cache[key]
-
-    # виртуальная иерархия
+    # virtual parent-child by link types
     if ENABLE_LINK_HIERARCHY and LINK_HIERARCHY_RULES:
         rules = [(a.lower(), b.lower()) for a, b in LINK_HIERARCHY_RULES]
         for a, b in link_pairs:
             ia = by_key.get(a); ib = by_key.get(b)
-            if not ia or not ib:
-                continue
+            if not ia or not ib: continue
             ta = issue_type_name(ia).lower(); tb = issue_type_name(ib).lower()
             if (ta, tb) in rules and not parent_map.get(b) and not epic_of.get(b):
-                parent_map[b] = a
-                children.setdefault(a, []).append(b)
+                parent_map[b] = a; children.setdefault(a, []).append(b)
             if (tb, ta) in rules and not parent_map.get(a) and not epic_of.get(a):
-                parent_map[a] = b
-                children.setdefault(b, []).append(a)
+                parent_map[a] = b; children.setdefault(b, []).append(a)
 
     def _tree_prefix(prefix_last_flags: List[bool], is_last: Optional[bool]) -> str:
-        if not prefix_last_flags and is_last is None:
-            return ""
+        if not prefix_last_flags and is_last is None: return ""
         parts: List[str] = []
-        for last in prefix_last_flags:
-            parts.append("   " if last else "│  ")
-        if is_last is not None:
-            parts.append("└─ " if is_last else "├─ ")
+        for last in prefix_last_flags: parts.append("   " if last else "│  ")
+        if is_last is not None: parts.append("└─ " if is_last else "├─ ")
         return "".join(parts)
 
     epics = [k for k, it in by_key.items() if issue_type_name(it).lower() == "epic"]
     roots_wo_epic = [k for k, it in by_key.items() if (k not in epics and not parent_map.get(k) and not epic_of.get(k))]
 
+    _artifact_cache: Dict[str, str] = {}
+    def artifact_for(key: str) -> str:
+        if key not in _artifact_cache:
+            # remotelink → confluence
+            try:
+                arr = jira_get(f"{JIRA_URL}/rest/api/2/issue/{key}/remotelink")
+            except Exception:
+                arr = []
+            host = CONFLUENCE_HOST.lower().strip()
+            link = ""
+            for rl in arr or []:
+                obj = (rl or {}).get("object") or {}
+                url = (obj.get("url") or "").strip()
+                title = (obj.get("title") or "Confluence").strip()
+                if url and (host in url.lower()):
+                    u = url.replace('"', '""'); t = title.replace('"', '""')
+                    link = f'=HYPERLINK("{u}","{t}")'
+                    break
+            _artifact_cache[key] = link
+        return _artifact_cache[key]
+
     def _extract_field_value(raw):
-        if isinstance(raw, dict):
-            return str(raw.get("value") or raw.get("name") or raw.get("displayName") or "")
-        if isinstance(raw, list):
-            return ", ".join(str(x.get("value") if isinstance(x, dict) else x) for x in raw if x not in (None, ""))
+        if isinstance(raw, dict): return str(raw.get("value") or raw.get("name") or raw.get("displayName") or "")
+        if isinstance(raw, list): return ", ".join(str(x.get("value") if isinstance(x, dict) else x) for x in raw if x not in (None, ""))
         return "" if raw is None else str(raw)
 
+    rows: List[dict] = []
+
     def row_from_key(key: str, level: int, rel_name: str, prefix: str) -> dict:
-        it = by_key[key]
-        f = it.get("fields", {})
+        it = by_key[key]; f = it.get("fields", {})
         assignee = _g(f, ["assignee", "displayName"]) or ""
         status = _g(f, ["status", "name"]) or ""
         issue_type = _g(f, ["issuetype", "name"]) or ""
@@ -433,6 +316,9 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
         fix_versions = ", ".join((v.get("name") for v in (f.get("fixVersions") or [])))
         block = _block_by_type(issue_type)
         return {
+            # служебные ключи для расчётов Overview (не выводим в Excel)
+            "_Key": key,
+            "_ParentKey": parent_map.get(key),
             "Release": rel_name,
             "Level": level,
             "Блок": block,
@@ -446,8 +332,6 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
             "Исполнитель": assignee,
             "Fix Versions": fix_versions,
         }
-
-    rows: List[dict] = []
 
     def _sorted_kids(parent_key: str) -> List[str]:
         return sorted(children.get(parent_key, []))
@@ -469,6 +353,8 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
 
     if roots_wo_epic:
         rows.append({
+            "_Key": "",
+            "_ParentKey": "",
             "Release": release_name,
             "Level": 0,
             "Блок": "",
@@ -490,48 +376,31 @@ def flatten_release_tree(release_name: str, issues: List[dict], epic_link_field:
     links_df = pd.DataFrame(links_rows) if links_rows else pd.DataFrame(columns=["From","Direction","Type","To"])
     return tree_df, links_df
 
-# ========= Основной сценарий =========
+# ========= Main =========
 
 def main():
     global EPIC_LINK_FIELD_ID, STORY_POINTS_FIELD_ID, RELEASE_NOTE_FIELD_ID_RESOLVED, SERVICE_FIELD_ID_RESOLVED
 
     print("=== Release Composer: старт ===")
-    print(f"JIRA_URL               : {JIRA_URL}")
-    print(f"PROJECT_KEY            : {PROJECT_KEY}")
-    print(f"ONLY_UNRELEASED        : {ONLY_UNRELEASED}")
-    print(f"VERSIONS_FILTER        : {', '.join(VERSIONS_FILTER) if VERSIONS_FILTER else '(все подходящие)'}")
-    print(f"ENABLE_LINK_HIERARCHY  : {ENABLE_LINK_HIERARCHY}")
-    print(f"CONFLUENCE_HOST        : {CONFLUENCE_HOST}")
-
     versions = list_versions(PROJECT_KEY)
     if not versions:
-        raise SystemExit("Нет подходящих версий (проверь фильтры/права)")
+        raise SystemExit("Нет подходящих версий")
 
     ids = get_field_ids()
     EPIC_LINK_FIELD_ID = ids.get("epic_link")
     STORY_POINTS_FIELD_ID = ids.get("story_points")
-    RELEASE_NOTE_FIELD_ID_RESOLVED = ids.get("release_note")
-    SERVICE_FIELD_ID_RESOLVED = ids.get("service")
-    if not EPIC_LINK_FIELD_ID:
-        print("[warn] Не нашёл id 'Epic Link' — иерархия может быть неполной")
-    if RELEASE_NOTE_FIELD_ID:
-        RELEASE_NOTE_FIELD_ID_RESOLVED = RELEASE_NOTE_FIELD_ID
-    if SERVICE_FIELD_ID:
-        SERVICE_FIELD_ID_RESOLVED = SERVICE_FIELD_ID
+    RELEASE_NOTE_FIELD_ID_RESOLVED = ids.get("release_note") or (RELEASE_NOTE_FIELD_ID or None)
+    SERVICE_FIELD_ID_RESOLVED = ids.get("service") or (SERVICE_FIELD_ID or None)
 
-    fields = [
-        "summary", "issuetype", "status", "assignee", "parent",
-        "subtasks", "issuelinks", "priority", "fixVersions"
-    ]
-    if EPIC_LINK_FIELD_ID:
-        fields.append(EPIC_LINK_FIELD_ID)
-    if RELEASE_NOTE_FIELD_ID_RESOLVED:
-        fields.append(RELEASE_NOTE_FIELD_ID_RESOLVED)
-    if SERVICE_FIELD_ID_RESOLVED:
-        fields.append(SERVICE_FIELD_ID_RESOLVED)
+    fields = ["summary", "issuetype", "status", "assignee", "parent",
+              "subtasks", "issuelinks", "priority", "fixVersions"]
+    if EPIC_LINK_FIELD_ID: fields.append(EPIC_LINK_FIELD_ID)
+    if RELEASE_NOTE_FIELD_ID_RESOLVED: fields.append(RELEASE_NOTE_FIELD_ID_RESOLVED)
+    if SERVICE_FIELD_ID_RESOLVED: fields.append(SERVICE_FIELD_ID_RESOLVED)
 
-    per_release = []
-    overview_rows: List[pd.DataFrame] = []
+    per_release = []            # (vname, tree_df_final, links_df, ov_df_types, coverage_row)
+    overview_rows_types: List[pd.DataFrame] = []
+    coverage_rows: List[dict] = []
 
     for v in versions:
         vname = v.get("name")
@@ -542,6 +411,41 @@ def main():
             print("  (нет задач)")
             continue
 
+        # Build tree (служебные _Key/_ParentKey остаются внутри до финального отбора колонок)
+        tree_full, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
+
+        # --- Coverage calc: L1 + его L2 = 1 кластер ---
+        df12 = tree_full[tree_full["Level"].isin([1, 2])].copy()
+        if not df12.empty:
+            def cluster_id(row):
+                try:
+                    lvl = int(row["Level"])
+                except Exception:
+                    lvl = 0
+                if lvl == 1:
+                    return row["_Key"] or ""
+                elif lvl == 2:
+                    return row["_ParentKey"] or ""
+                return ""
+            df12["_cluster"] = df12.apply(cluster_id, axis=1)
+            df12 = df12[df12["_cluster"].astype(str) != ""]
+            grp = df12.groupby("_cluster", dropna=True)
+            total_clusters = len(grp)
+            with_artifacts = int(grp["Артефакт"].apply(lambda s: any(str(x).strip() != "" for x in s)).sum())
+            coverage_pct = (with_artifacts / total_clusters) if total_clusters else 0.0
+        else:
+            total_clusters = 0
+            with_artifacts = 0
+            coverage_pct = 0.0
+
+        coverage_rows.append({
+            "Release": vname,
+            "Tasks (L1 clusters)": total_clusters,
+            "With artifact": with_artifacts,
+            "% Coverage": coverage_pct,  # как дробь 0..1 (форматируем в Excel как %)
+        })
+
+        # Типы (для сводной по типам)
         tmp = []
         for it in issues:
             f = it.get("fields", {})
@@ -550,63 +454,55 @@ def main():
                 "Тип": (f.get("issuetype") or {}).get("name"),
                 "Ключ": it.get("key"),
             })
-        ov = pd.DataFrame(tmp)
-        overview_rows.append(ov)
+        ov_types = pd.DataFrame(tmp)
+        overview_rows_types.append(ov_types)
 
-        tree_df, links_df = flatten_release_tree(vname, issues, EPIC_LINK_FIELD_ID)
-
-        # Порядок колонок
+        # Итоговые колонки + сортировка Развитие→Сопровождение
         tree_cols = [
             "Level", "Блок", "Краткое содержание", "Задача", "Тип", "Статус",
             "Услуга", "Артефакт", "Release Note", "Исполнитель", "Fix Versions"
         ]
-        tree_df = tree_df[tree_cols]
+        df_final = tree_full[tree_cols].copy()
+        order_map = {"Развитие": 0, "Сопровождение": 1}
+        df_final["_bo"] = df_final["Блок"].map(order_map).fillna(2)
+        df_final = df_final.sort_values(by=["_bo"], kind="stable").drop(columns=["_bo"])
 
-        # Порядок блоков: Развитие → Сопровождение → прочее
-        block_order_map = {"Развитие": 0, "Сопровождение": 1}
-        tree_df["_block_order"] = tree_df["Блок"].map(block_order_map).fillna(2)
-        tree_df = tree_df.sort_values(by=["_block_order"], kind="stable").drop(columns=["_block_order"])
-
-        per_release.append((vname, tree_df, links_df, ov))
+        per_release.append((vname, df_final, links_df, ov_types))
 
     if not per_release:
         raise SystemExit("Нет задач ни в одной из подходящих версий")
 
     writer_path = OUT_DIR / f"release_composer_{PROJECT_KEY}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
     with pd.ExcelWriter(writer_path, engine="openpyxl") as xw:
+        # ----- Tree sheets -----
         for vname, tree_df, links_df, _ov in per_release:
             sheet_tree = make_sheet_name(vname, "Tree")
             tree_df.to_excel(xw, index=False, sheet_name=sheet_tree)
             ws: Worksheet = xw.sheets[sheet_tree]
-
             insert_legend(ws, "Блоки: Развитие — голубой; Сопровождение — жёлтый; Level 1 — светло-зелёный; Level 2 — светло-оранжевый")
-
             last_col_letter = get_column_letter(ws.max_column)
             ws.auto_filter.ref = f"A2:{last_col_letter}{ws.max_row}"
             ws.freeze_panes = "A3"
 
             for df_idx in range(len(tree_df)):
                 excel_row = 3 + df_idx
-                try:
-                    level_val = int(tree_df.iloc[df_idx]["Level"] or 0)
-                except Exception:
-                    level_val = 0
+                try: level_val = int(tree_df.iloc[df_idx]["Level"] or 0)
+                except Exception: level_val = 0
                 ws.row_dimensions[excel_row].outlineLevel = level_val
                 if level_val > COLLAPSE_LEVEL:
                     ws.row_dimensions[excel_row].hidden = True
 
             ws.sheet_properties.outlinePr.summaryBelow = True
             ws.sheet_properties.outlinePr.applyStyles = True
-
             apply_wrap(ws, ["Краткое содержание", "Release Note"], header_row_idx=2)
             align_top_all(ws, header_row_idx=2)
             apply_row_styles(ws, header_row_idx=2)
 
-        # ===== Overview: количество задач по типам (без статусов) =====
-        if overview_rows:
-            overview = pd.concat(overview_rows, ignore_index=True)
+        # ----- Overview -----
+        if overview_rows_types:
+            overview_types = pd.concat(overview_rows_types, ignore_index=True)
             pivot = pd.pivot_table(
-                overview,
+                overview_types,
                 index=["Release"],
                 columns=["Тип"],
                 values="Ключ",
@@ -618,7 +514,7 @@ def main():
             ws_ov: Worksheet = xw.sheets["Overview"]
             ws_ov.auto_filter.ref = ws_ov.dimensions
             ws_ov.freeze_panes = "A2"
-            # выравнивание по верхнему краю в Overview
+            # вертикальное выравнивание
             for row in ws_ov.iter_rows(min_row=1, max_row=ws_ov.max_row, min_col=1, max_col=ws_ov.max_column):
                 for cell in row:
                     cell.alignment = Alignment(
@@ -627,7 +523,20 @@ def main():
                         vertical="top"
                     )
 
-    # Автофит ширины листов (включая Overview)
+            # блок "Покрытие артефактами" под сводной
+            start_row = ws_ov.max_row + 2
+            headers = ["Release", "Tasks (L1 clusters)", "With artifact", "% Coverage"]
+            for j, h in enumerate(headers, start=1):
+                cell = ws_ov.cell(row=start_row, column=j, value=h)
+                cell.font = Font(bold=True)
+            for i, row in enumerate(coverage_rows, start=start_row + 1):
+                ws_ov.cell(row=i, column=1, value=row["Release"])
+                ws_ov.cell(row=i, column=2, value=row["Tasks (L1 clusters)"])
+                ws_ov.cell(row=i, column=3, value=row["With artifact"])
+                c = ws_ov.cell(row=i, column=4, value=row["% Coverage"])
+                c.number_format = "0.0%"
+
+    # автофит (включая Overview)
     excel_autofit_smart(writer_path, width_overrides={
         "Level": 6,
         "Блок": 16,
@@ -636,20 +545,58 @@ def main():
         "Тип": 18,
         "Статус": 16,
         "Услуга": 20,
-        # "Артефакт": auto,
+        # "Артефакт": auto
         "Release Note": 50,
-        # "Исполнитель": auto,
+        # "Исполнитель": auto
         "Fix Versions": 28,
     })
 
     print(f"Готово → {writer_path}")
 
+# ========= Aux API =========
+
+def list_versions(project_key: str) -> List[dict]:
+    if not project_key or str(project_key).strip().lower() in {"none", "null", "-", "—", "–"}:
+        raise SystemExit("PROJECT_KEY пустой")
+    versions = jira_get(f"{JIRA_URL}/rest/api/2/project/{project_key}/versions")
+    out = []
+    for v in versions:
+        if VERSIONS_FILTER and v.get("name") not in VERSIONS_FILTER: continue
+        if ONLY_UNRELEASED and v.get("released"): continue
+        if v.get("archived"): continue
+        out.append({
+            "id": v.get("id"),
+            "name": v.get("name"),
+            "released": v.get("released"),
+            "releaseDate": v.get("releaseDate"),
+            "overdue": v.get("overdue"),
+        })
+    out.sort(key=lambda x: (x.get("releaseDate") is None,
+                            x.get("releaseDate") or "9999-12-31",
+                            str(x.get("name") or "")))
+    if not out:
+        print("[warn] Версии не найдены по фильтрам.")
+    return out
+
+def jql_search(jql: str, fields: List[str], max_results: int = 1000) -> List[dict]:
+    url = f"{JIRA_URL}/rest/api/2/search"
+    start_at = 0
+    issues: List[dict] = []
+    while True:
+        payload = {"jql": jql, "startAt": start_at, "maxResults": min(100, max_results - start_at), "fields": fields}
+        data = jira_post(url, payload)
+        issues.extend(data.get("issues", []))
+        fetched = len(data.get("issues", []))
+        start_at += fetched
+        if start_at >= data.get("total", 0) or start_at >= max_results or fetched == 0:
+            break
+    return issues
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 2:
         pk = sys.argv[1].strip()
-        if pk:
-            PROJECT_KEY = pk
+        if pk: PROJECT_KEY = pk
     if len(sys.argv) >= 3:
         VERSIONS_FILTER = [sys.argv[2].strip()]
     main()

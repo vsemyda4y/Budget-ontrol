@@ -3,7 +3,7 @@ r"""
 Worklog.py — Tempo → русские колонки, кликабельные ссылки, без «Сотрудник:Логин».
 + Summary (Описание) и Labels (Метки) из Jira Issue fields.
 + FTE построчно и корректный помесячный FTE (monthly_fte + monthly_total).
-+ Норма рабочих дней считается по workalendar.europe.Russia (авто-год по фактическим датам списаний).
++ ВРЕМЕННО: нормы рабочих дней зашиты для 2025 года строго по производственному календарю РФ.
 + Векторная агрегация (без GroupBy.apply и без FutureWarning).
 + Безопасная функция Excel HYPERLINK (без f-строк).
 """
@@ -13,11 +13,6 @@ from datetime import datetime, timedelta, date
 import concurrent.futures
 from pathlib import Path
 from typing import Dict, Tuple, Optional
-from calendar import monthrange
-
-# === Календарь РФ (workalendar) ===
-from workalendar.europe import Russia
-_CAL_RU = Russia()
 
 # === canon utils (ваши вспомогательные) ===
 from canon_utils import load_columns_map, canonize_fact, write_schema_json, norm_text, to_mmYYYY
@@ -27,16 +22,12 @@ JIRA_URL     = os.getenv("JIRA_URL", "").strip()
 BEARER_TOKEN = os.getenv("JIRA_TEMPO_TOKEN", "").strip()
 
 # Окно выгрузки из Tempo (только для запроса; на расчёт FTE не влияет)
-# По умолчанию — текущий календарный год; можно переопределить env-переменными.
 _today = date.today()
 FROM_DATE = os.getenv("FROM_DATE", f"{_today.year}-01-01")
 TO_DATE   = os.getenv("TO_DATE",   f"{_today.year}-12-31")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
 EXCEL_AUTOFIT = os.getenv("EXCEL_AUTOFIT", "1") == "1"
-
-# (опционально) Точечные переопределения РАБОЧИХ дней: "YYYY-MM=18;YYYY-MM=21"
-MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
 
 # (опционально) Автозаполнение Account Key по summary для проектов из списка
 FILL_ACCOUNT_ENABLED  = os.getenv("FILL_ACCOUNT_ENABLED", "1") == "1"
@@ -54,6 +45,33 @@ WL_OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ====== Rates directory config ======
 RATES_FOLDER  = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\Контроль бюджета\Ставки")
 RATES_PATTERN = "employee_rate_directory_*.xlsx"
+
+# ========= ВРЕМЕННЫЙ «ЖЁСТКИЙ» ИСТОЧНИК НОРМ (производственный календарь РФ, 2025) =========
+EXPECTED_WORKDAYS_2025: Dict[str, int] = {
+    "2025-01": 17,
+    "2025-02": 20,
+    "2025-03": 21,
+    "2025-04": 22,
+    "2025-05": 18,
+    "2025-06": 19,
+    "2025-07": 23,
+    "2025-08": 21,
+    "2025-09": 22,
+    "2025-10": 23,
+    "2025-11": 19,
+    "2025-12": 22,
+}
+
+def workdays_for_ym(ym: str) -> int:
+    """
+    ВРЕМЕННО: возвращает число рабочих дней ТОЛЬКО для 2025 из зашитого словаря.
+    Если месяц вне 2025 — скрипт падает, чтобы не было «тихих» расхождений.
+    """
+    if not ym:
+        raise SystemExit("[ERROR] workdays_for_ym: пустой ym")
+    if ym in EXPECTED_WORKDAYS_2025:
+        return EXPECTED_WORKDAYS_2025[ym]
+    raise SystemExit(f"[ERROR] Нет нормы для {ym}. Сейчас разрешён только 2025 год (см. EXPECTED_WORKDAYS_2025).")
 
 # ========= Helpers: выбор колонок/файлов и пр. =========
 def _pick_latest_file(folder: Path, pattern: str) -> Optional[Path]:
@@ -208,7 +226,7 @@ def save_json(path: Path, data: Dict[str, str]):
 
 # ========= Jira/Tempo helpers =========
 def get_display_name(wid: str) -> Tuple[str, str]:
-    url = f"{JIRA_URL}/rest/api/2/user?key={wid}"
+    url = "{}/rest/api/2/user?key={}".format(JIRA_URL, wid)
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code == 200:
@@ -219,7 +237,7 @@ def get_display_name(wid: str) -> Tuple[str, str]:
     return wid, wid
 
 def fetch_issue_summary_labels(issue_key: str) -> Tuple[str, Dict[str, str]]:
-    url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}?fields=summary,labels"
+    url = "{}/rest/api/2/issue/{}?fields=summary,labels".format(JIRA_URL, issue_key)
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code == 200:
@@ -240,49 +258,15 @@ def sanitize_for_account(title: str) -> str:
     return s[:100]
 
 def hyperlink_formula(jira_base_url: str, key: str) -> str:
-    """Возвращает строку формулы Excel HYPERLINK без f-строк (устраняет SyntaxError).
-    Дублируем кавычки для Excel: " → "".
-    """
+    """Excel HYPERLINK без f-строк (совместимо)."""
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
     base = str(jira_base_url).rstrip('/')
     return '=HYPERLINK("{}", "{}")'.format("{}/browse/{}".format(base, k), k)
 
-# ========= Нормы рабочих дней: строго по workalendar, год — по фактическим датам =========
-_WORKDAYS_CACHE: Dict[str, int] = {}
-
-def _iter_month_dates(year: int, month: int):
-    days = monthrange(year, month)[1]
-    for d in range(1, days + 1):
-        yield date(year, month, d)
-
-def workdays_for_ym(ym: str) -> int:
-    """Количество рабочих дней в ym='YYYY-MM' по workalendar.Russia.
-       Учитываются праздники и переносы, включая рабочие субботы.
-    """
-    if not ym:
-        return 20
-    if ym in _WORKDAYS_CACHE:
-        return _WORKDAYS_CACHE[ym]
-
-    # override из ENV имеет наивысший приоритет (если задан)
-    if MONTH_NORM_OVERRIDE:
-        for part in (p.strip() for p in MONTH_NORM_OVERRIDE.split(";") if "=" in p):
-            ym_key, val = [x.strip() for x in part.split("=", 1)]
-            if ym_key == ym:
-                _WORKDAYS_CACHE[ym] = int(val)
-                return _WORKDAYS_CACHE[ym]
-
-    y, m = map(int, ym.split("-"))
-    start = date(y, m, 1)
-    end   = (date(y, m+1, 1) - timedelta(days=1)) if m < 12 else date(y, 12, 31)
-    days = int(_CAL_RU.get_working_days_delta(start, end))
-    _WORKDAYS_CACHE[ym] = days
-    return days
-
 # ========= Tempo fetch =========
-tempo_url = f"{JIRA_URL}/rest/tempo-timesheets/4/worklogs/search"
+tempo_url = "{}/rest/tempo-timesheets/4/worklogs/search".format(JIRA_URL)
 payload = {"from": FROM_DATE, "to": TO_DATE}
 resp = requests.post(tempo_url, json=payload, headers=HEADERS, timeout=120)
 if resp.status_code != 200:
@@ -295,7 +279,7 @@ worker_map_path = WL_DIR / 'worker_map.json'
 worker_map = load_json(worker_map_path)
 new_ids = [wid for wid in worker_ids if wid and wid not in worker_map]
 if new_ids:
-    print(f"Новых пользователей: {len(new_ids)} — обновляем кэш...")
+    print("Новых пользователей: {} — обновляем кэш...".format(len(new_ids)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         for wid, name in ex.map(get_display_name, new_ids):
             worker_map[wid] = name
@@ -308,7 +292,7 @@ summary_labels_cache = load_json(summary_labels_cache_path)
 all_issue_keys = sorted({(w.get("issue") or {}).get("key") for w in worklogs if (w.get("issue") or {}).get("key")})
 need_keys_sl = [k for k in all_issue_keys if k and k not in summary_labels_cache]
 if need_keys_sl:
-    print(f"Новых issues для summary+labels: {len(need_keys_sl)}")
+    print("Новых issues для summary+labels: {}".format(len(need_keys_sl)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         for ikey, data in ex.map(fetch_issue_summary_labels, need_keys_sl):
             summary_labels_cache[ikey] = data
@@ -340,9 +324,12 @@ for w in worklogs:
 
     hours = (w.get("timeSpentSeconds") or 0) / 3600.0
 
-    # FTE построчно строго от рабочих дней ФАКТИЧЕСКОГО месяца:
-    days_norm = workdays_for_ym(ym) if ym else 20
-    fte = (hours / (8.0 * days_norm)) if days_norm else None
+    # FTE построчно строго от рабочих дней ФАКТИЧЕСКОГО месяца (зашитые нормы 2025):
+    days_norm = workdays_for_ym(ym) if ym else None
+    if days_norm is None:
+        fte = None
+    else:
+        fte = (hours / (8.0 * days_norm)) if days_norm else None
 
     issue_key   = (issue.get("key") or "").strip()
     project_key = issue.get("projectKey")
@@ -355,7 +342,7 @@ for w in worklogs:
 
     if FILL_ACCOUNT_ENABLED and project_key in FILL_ACCOUNT_PROJECTS and not str(account_key or "").strip():
         smry = summary_for_report or issue_key
-        account_key = f"{FILL_ACCOUNT_PREFIX}{sanitize_for_account(smry)}" if FILL_ACCOUNT_PREFIX else sanitize_for_account(smry)
+        account_key = "{}{}".format(FILL_ACCOUNT_PREFIX, sanitize_for_account(smry)) if FILL_ACCOUNT_PREFIX else sanitize_for_account(smry)
         filled_cnt += 1
 
     rows.append({
@@ -373,19 +360,19 @@ for w in worklogs:
         "_ym":                ym,  # для агрегации
     })
 
-print(f"Автозаполнение Account Key из summary: {filled_cnt} задач.")
+print("Автозаполнение Account Key из summary: {} задач.".format(filled_cnt))
 
 df = pd.DataFrame(rows)
 
 # ========= RU + ссылка =========
-def hyperlink_formula(jira_base_url: str, key: str) -> str:
+def hyperlink_formula_safe(jira_base_url: str, key: str) -> str:
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
     base = str(jira_base_url).rstrip('/')
     return '=HYPERLINK("{}", "{}")'.format("{}/browse/{}".format(base, k), k)
 
-df.insert(0, "Ссылка на задачу", df["IssueKey_tmp"].map(lambda k: hyperlink_formula(JIRA_URL, k)))
+df.insert(0, "Ссылка на задачу", df["IssueKey_tmp"].map(lambda k: hyperlink_formula_safe(JIRA_URL, k)))
 df.drop(columns=["IssueKey_tmp"], inplace=True)
 df.rename(columns={
     "Worker Name":        "Сотрудник",
@@ -411,7 +398,7 @@ try:
     df = enrich_with_rates(df, _rates_df)
     df = reorder_final(df)
 except Exception as _e:
-    print(f"[RATES] Ошибка обогащения ставками: {_e}")
+    print("[RATES] Ошибка обогащения ставками: {}".format(_e))
 
 # ========= Агрегация (векторно) =========
 # тех. ключ месяца
@@ -441,14 +428,14 @@ monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт
 
 # ========= Excel =========
 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-raw_path = WL_DIR / f"worklogs_{stamp}.xlsx"
+raw_path = WL_DIR / "worklogs_{}.xlsx".format(stamp)
 with pd.ExcelWriter(raw_path, engine="openpyxl") as w:
     df.to_excel(w, index=False, sheet_name="worklogs_raw")
     monthly.to_excel(w, index=False, sheet_name="monthly_fte")
     monthly_total.to_excel(w, index=False, sheet_name="monthly_total")
 if EXCEL_AUTOFIT:
     excel_autofit_smart(raw_path)
-print(f"✅ RAW: {raw_path}")
+print("✅ RAW: {}".format(raw_path))
 
 # ========= Canonical =========
 columns_map = load_columns_map(COLUMNS_MAP_PATH)
@@ -460,7 +447,7 @@ if "Сотрудник:Логин" in df_can.columns:
     df_can.drop(columns=["Сотрудник:Логин"], inplace=True, errors="ignore")
 df_can = df_can[[c for c in RU_ORDER if c in df_can.columns] + [c for c in df_can.columns if c not in RU_ORDER]]
 
-can_path = WL_OUT_DIR / f"worklogs_canonical_{stamp}.xlsx"
+can_path = WL_OUT_DIR / "worklogs_canonical_{}.xlsx".format(stamp)
 with pd.ExcelWriter(can_path, engine="openpyxl") as w:
     df_can.to_excel(w, index=False, sheet_name="worklogs")
     monthly.to_excel(w, index=False, sheet_name="monthly_fte")
@@ -472,8 +459,8 @@ if EXCEL_AUTOFIT:
 
 write_schema_json(can_path.with_suffix(".schema.json"),
                   {"worklogs": df_can, "monthly_fte": monthly, "monthly_total": monthly_total})
-print(f"✅ Canonical: {can_path}")
-print(f"🧾 Schema:    {can_path.with_suffix('.schema.json')}")
+print("✅ Canonical: {}".format(can_path))
+print("🧾 Schema:    {}".format(can_path.with_suffix(".schema.json")))
 
 # ========= Диагностика (пример: май 2025) =========
 try:
@@ -482,6 +469,7 @@ try:
     rdays = workdays_for_ym(ym_check)
     denom = 8 * rdays
     if denom:
-        print(f"[CHECK] МАЙ 2025: Σчасы={may_hours_total}, раб_дней={rdays}, знаменатель={denom}, FTE={may_hours_total/denom:.3f}")
+        print("[CHECK] МАЙ 2025: Σчасы={}, раб_дней={}, знаменатель={}, FTE={:.3f}".format(
+            may_hours_total, rdays, denom, (may_hours_total/denom if denom else 0)))
 except Exception as e:
-    print(f"[CHECK] Ошибка диагностики мая: {e}")
+    print("[CHECK] Ошибка диагностики мая: {}".format(e))

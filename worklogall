@@ -47,6 +47,7 @@ WL_OUT_DIR = WL_DIR / "Результат"
 RATES_FOLDER  = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\Контроль бюджета\Ставки")
 RATES_PATTERN = "employee_rate_directory_*.xlsx"  # mask for the rates files
 
+# ================= helpers for rates =================
 def _pick_latest_file(folder: Path, pattern: str) -> Optional[Path]:
     files = sorted(Path(folder).glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
@@ -183,7 +184,7 @@ def excel_autofit_smart(path: Path):
     except Exception as e:
         print(f"[autofit] пропущено: {e}")
 
-# ========= helpers =========
+# ========= misc helpers =========
 def load_json(path: Path) -> Dict[str, str]:
     if path.exists():
         try:
@@ -236,7 +237,7 @@ def hyperlink_formula(jira_base_url: str, key: str) -> str:
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
-    return f'=HYPERLINK("{jira_base_url.rstrip("/")}/browse/{k}","{k}")'
+    return f'=HYPERLINK("{jira_base_url.rstrip('/')}/browse/{k}","{k}")'
 
 # ========= Нормы рабочего времени =========
 def build_month_norms(year: int) -> Dict[str, int]:
@@ -310,11 +311,9 @@ def parse_started_ts(value) -> Optional[datetime]:
     Устраняет утечки в соседние месяцы из-за TZ.
     """
     try:
-        # Сначала распарсим в UTC-aware
         ts = pd.to_datetime(value, utc=True, errors="coerce")
         if pd.isna(ts):
             return None
-        # Переведём в целевой TZ, затем уберём TZ (наивное локальное)
         ts = ts.tz_convert(TIMEZONE).tz_localize(None)
         return ts.to_pydatetime()
     except Exception:
@@ -391,6 +390,7 @@ df.rename(columns={
 RU_ORDER = ["Тип задачи","Ссылка на задачу","Описание","Метки","Проект","Сервис","Месяц",
             "Сотрудник","Сотрудник:Категория","Сотрудник:ЦК","Сотрудник:Направление",
             "Тип активности","Часы факт","FTE факт","Ставка","Стоимость, ₽"]
+
 df = df[[c for c in RU_ORDER if c in df.columns] + [c for c in df.columns if c not in RU_ORDER]]
 
 # ====== RATES ENRICHMENT ======
@@ -401,35 +401,28 @@ try:
 except Exception as _e:
     print(f"[RATES] Ошибка обогащения ставками: {_e}")
 
-# ========= 6) Агрегированный FTE по месяцу/сотруднику =========
-def calc_monthly_fte(group: pd.DataFrame) -> pd.Series:
-    ym = group.name[0] if isinstance(group.name, tuple) else group.name
-    total_hours = group["Часы факт"].fillna(0).sum()
-    if MONTH_NORM_HOURS > 0:
-        fte_m = total_hours / MONTH_NORM_HOURS
-        norm_days = None
-        norm_hours = MONTH_NORM_HOURS
-    else:
-        norm_days = month_norm_days(ym)
-        norm_hours = 8 * norm_days
-        fte_m = total_hours / norm_hours if norm_hours else None
-    return pd.Series({
-        "Часы факт": round(total_hours, 2),
-        "Норма_дней": norm_days,
-        "Норма_часов": norm_hours,
-        "FTE месяц": None if fte_m is None else round(fte_m, 3)
-    })
-
-# приведение _ym
+# ========= 6) Векторная агрегация FTE по месяцу/сотруднику =========
+# Приводим технический ключ месяца
 if "_ym" not in df.columns:
     df["_ym"] = pd.to_datetime(df["Месяц"], format="%m/%Y", errors="coerce").dt.strftime("%Y-%m")
 
+# 1) Суммируем часы
 monthly = (
-    df.groupby(["_ym","Сотрудник"], dropna=False)
-      .apply(calc_monthly_fte)
+    df.groupby(["_ym", "Сотрудник"], dropna=False)["Часы факт"]
+      .sum()
       .reset_index()
-      .rename(columns={"_ym":"Месяц (YYYY-MM)"})
+      .rename(columns={"_ym": "Месяц (YYYY-MM)"})
 )
+
+# 2) Добавляем норму и рассчитываем FTE месяц
+if MONTH_NORM_HOURS > 0:
+    monthly["Норма_дней"]  = None
+    monthly["Норма_часов"] = MONTH_NORM_HOURS
+    monthly["FTE месяц"]   = (monthly["Часы факт"] / MONTH_NORM_HOURS).round(3)
+else:
+    monthly["Норма_дней"]  = monthly["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
+    monthly["Норма_часов"] = (8 * monthly["Норма_дней"]).astype("Int64")
+    monthly["FTE месяц"]   = (monthly["Часы факт"] / monthly["Норма_часов"]).round(3)
 
 # ========= 7) RAW Excel =========
 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -466,7 +459,6 @@ print(f"✅ Canonical: {can_path}")
 print(f"🧾 Schema:    {can_path.with_suffix('.schema.json')}")
 
 # ========= 9) Диагностика (по желанию) =========
-# Пример проверки для мая текущего YEAR:
 try:
     ym_check = f"{YEAR}-05"
     may_hours = monthly.loc[monthly["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum()
@@ -474,6 +466,7 @@ try:
         denom = MONTH_NORM_HOURS
     else:
         denom = 8 * month_norm_days(ym_check)
-    print(f"[CHECK] Май {YEAR}: Σчасы={may_hours}, знаменатель={denom}, FTE={may_hours/denom if denom else None:.3f}")
-except Exception as e:
+    if denom:
+        print(f"[CHECK] Май {YEAR}: Σчасы={may_hours}, знаменатель={denom}, FTE={may_hours/denom:.3f}")
+except Exception:
     pass

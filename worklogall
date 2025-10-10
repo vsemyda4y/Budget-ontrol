@@ -2,9 +2,8 @@
 r"""
 Worklog.py — Tempo → русские колонки, кликабельные ссылки, без «Сотрудник:Логин».
 + Summary (Описание) и Labels (Метки) из Jira Issue fields.
-+ FTE построчно (как было) и корректный помесячный FTE в отдельном листе (monthly_fte).
 
-Порядок колонок:
+Порядок колонок (для лучшей читаемости):
   Тип задачи, Ссылка на задачу, Описание, Метки, Проект, Сервис, Месяц,
   Сотрудник, Сотрудник:Категория, Сотрудник:ЦК, Сотрудник:Направление,
   Тип активности, Часы факт, FTE факт, Ставка, Стоимость, ₽
@@ -20,20 +19,11 @@ from typing import Dict, Tuple, List, Optional
 from canon_utils import load_columns_map, canonize_fact, write_schema_json, norm_text, to_mmYYYY
 
 # ========= ENV =========
-JIRA_URL       = os.getenv("JIRA_URL", "").strip()
-BEARER_TOKEN   = os.getenv("JIRA_TEMPO_TOKEN", "").strip()
-YEAR           = int(os.getenv("YEAR", datetime.now().year))
-TIMEZONE       = os.getenv("TIMEZONE", "Europe/Moscow").strip()
-
-# Нормы: 0 -> считаем по workalendar;
-# если >0, используем фиксированные часы/месяц (например, 160)
-MONTH_NORM_HOURS = float(os.getenv("MONTH_NORM_HOURS", "0"))
-
-# Точечные переопределения нормы рабочих дней: "YYYY-MM=18;YYYY-MM=21"
-MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
-
+JIRA_URL     = os.getenv("JIRA_URL", "https://jira.nlmk.com")
+BEARER_TOKEN = os.getenv("JIRA_TEMPO_TOKEN", "MzU0MzcxNjA3NDc2Orij/u46oRiprLkwp1B7r55Yx7bE")
+YEAR         = int(os.getenv("YEAR", datetime.now().year))
 if not JIRA_URL or not BEARER_TOKEN:
-    raise SystemExit("ENV JIRA_URL или JIRA_TEMPO_TOKEN не заданы")
+    raise SystemExit("ENV JIRA_URL/JIRA_TEMPO_TOKEN не заданы")
 
 FILL_ACCOUNT_ENABLED  = os.getenv("FILL_ACCOUNT_ENABLED", "1") == "1"
 FILL_ACCOUNT_PROJECTS = [p.strip() for p in os.getenv("FILL_ACCOUNT_PROJECTS", "INT").split(";") if p.strip()]
@@ -43,11 +33,10 @@ EXCEL_AUTOFIT         = os.getenv("EXCEL_AUTOFIT", "1") == "1"  # умный а�
 WL_DIR     = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\TCO\WL")
 WL_OUT_DIR = WL_DIR / "Результат"
 
-# ====== Rates directory config ======
+# ====== Rates directory config (added) ======
 RATES_FOLDER  = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\Контроль бюджета\Ставки")
 RATES_PATTERN = "employee_rate_directory_*.xlsx"  # mask for the rates files
 
-# ================= helpers for rates =================
 def _pick_latest_file(folder: Path, pattern: str) -> Optional[Path]:
     files = sorted(Path(folder).glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
@@ -66,11 +55,18 @@ def _pick_col(df: pd.DataFrame, candidates):
     return None
 
 def normalize_employee_name(name: str) -> str:
+    """Нормализует имя сотрудника для джойна:
+    - убирает суффиксы вида ' [X]' или любые квадратные скобки в конце (может быть несколько)
+    - убирает неразрывные пробелы, лишние пробелы по краям и между словами
+    """
     if name is None:
         return ""
     s = str(name)
+    # заменить неразрывные и узкие пробелы на обычные
     s = s.replace("\u00a0", " ").replace("\u202f", " ")
+    # убрать все группы [...] в конце строки (одну или несколько)
     s = re.sub(r'\s*(\[[^\]]+\]\s*)+$', '', s).strip()
+    # схлопнуть мульти-пробелы
     s = re.sub(r'\s+', ' ', s)
     return s
 
@@ -98,6 +94,8 @@ def load_rate_directory_or_none(folder: Path, pattern: str) -> Optional[pd.DataF
     if cat:  rename[cat]  = "Сотрудник:Категория"
     rdf = rdf.rename(columns=rename)
     rdf["Ставка"] = pd.to_numeric(rdf["Ставка"], errors="coerce")
+
+    # нормализованный ключ + дедупликация по нему
     rdf["Сотрудник_norm"] = rdf["Сотрудник"].apply(normalize_employee_name)
     keep = [c for c in ["Сотрудник","Ставка","Сотрудник:ЦК","Сотрудник:Направление","Сотрудник:Категория","Сотрудник_norm"] if c in rdf.columns]
     rdf = rdf[keep].dropna(subset=["Сотрудник_norm"]).drop_duplicates(subset=["Сотрудник_norm"])
@@ -110,26 +108,41 @@ def enrich_with_rates(df: pd.DataFrame, rates: Optional[pd.DataFrame]) -> pd.Dat
     if "Сотрудник" not in df.columns:
         emp = _pick_col(df, ["Сотрудник","ФИО","Сотрудник ФИО"])
         if not emp:
-            print("[RATES] Нет колонки 'Сотрудник' — пропускаю ставки.")
+            print("[RATES] Нет колонки 'Сотрудник' во входных данных — пропускаю ставки.")
             return df
         if emp != "Сотрудник":
             df = df.rename(columns={emp:"Сотрудник"})
+    # нормализованный ключ для обеих таблиц
     df["Сотрудник_norm"] = df["Сотрудник"].apply(normalize_employee_name)
     if "Сотрудник_norm" not in rates.columns:
         rates["Сотрудник_norm"] = rates["Сотрудник"].apply(normalize_employee_name)
     merged = df.merge(rates, on="Сотрудник_norm", how="left", suffixes=("", "_rate"))
+
+    # ставка в отчёте под именем "Ставка"
     if "Ставка, ₽/ч" in merged.columns and "Ставка" not in merged.columns:
         merged = merged.rename(columns={"Ставка, ₽/ч": "Ставка"})
+    elif "Ставка" not in merged.columns and "Ставка, ₽/ч" not in merged.columns:
+        # если ни одной нет, но есть raw "Ставка" из справочника — используем её
+        pass
+
+    # стоимость = часы * ставка
     hours_col = _pick_col(merged, ["Часы факт","Часы","Hours","Время, ч"])
     if hours_col:
+        # найдём колонку ставки
         rate_col = "Ставка" if "Ставка" in merged.columns else ("Ставка, ₽/ч" if "Ставка, ₽/ч" in merged.columns else None)
         if rate_col:
             merged["Стоимость, ₽"] = (merged[hours_col].fillna(0) * merged[rate_col].fillna(0)).round(2)
+    else:
+        print("[RATES] Не нашёл колонку часов — не считаю 'Стоимость, ₽'.")
+
+    # убрать лишние/служебные столбцы
     if "Ставка, ₽/ч" in merged.columns and "Ставка" in merged.columns:
         merged = merged.drop(columns=["Ставка, ₽/ч"])
-    for c in ["Сотрудник_rate","Сотрудник_norm"]:
-        if c in merged.columns:
-            merged = merged.drop(columns=[c])
+    if "Сотрудник_rate" in merged.columns:
+        merged = merged.drop(columns=["Сотрудник_rate"])
+    if "Сотрудник_norm" in merged.columns:
+        merged = merged.drop(columns=["Сотрудник_norm"])
+
     return merged
 
 # ====== Final column order helper ======
@@ -141,9 +154,9 @@ def reorder_final(df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in FINAL_ORDER if c in df.columns]
     rest = [c for c in df.columns if c not in keep]
     return df[keep + rest]
-
 # ============================================
 WL_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
 COLUMNS_MAP_PATH = Path(__file__).with_name("columns_map.json")
 
 HEADERS = {
@@ -153,7 +166,11 @@ HEADERS = {
 }
 
 # ========= Умный автофит =========
-WIDTH_OVERRIDES = {"Ссылка на задачу": 16, "Сервис": 34, "Описание": 60}
+WIDTH_OVERRIDES = {
+    "Ссылка на задачу": 16,
+    "Сервис": 34,
+    "Описание": 60,
+}
 CLAMP_MIN, CLAMP_MAX = 6, 60
 
 def _visible_text(cell_val):
@@ -184,7 +201,7 @@ def excel_autofit_smart(path: Path):
     except Exception as e:
         print(f"[autofit] пропущено: {e}")
 
-# ========= misc helpers =========
+# ========= helpers =========
 def load_json(path: Path) -> Dict[str, str]:
     if path.exists():
         try:
@@ -212,7 +229,22 @@ def get_display_name(wid: str) -> Tuple[str, str]:
         time.sleep(0.2)
     return wid, wid
 
+def fetch_issue_summary(issue_key: str) -> Tuple[str, str]:
+    """Старый лёгкий фетчер summary — оставлен для обратной совместимости (используется в автозаполнении Account Key)."""
+    try:
+        url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}?fields=summary"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json() or {}
+            smry = (data.get("fields") or {}).get("summary")
+            if smry:
+                return issue_key, str(smry)
+    except Exception:
+        time.sleep(0.2)
+    return issue_key, issue_key
+
 def fetch_issue_summary_labels(issue_key: str) -> Tuple[str, Dict[str, str]]:
+    """Фетчер summary+labels для заполнения Описания и Меток в отчёте."""
     url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}?fields=summary,labels"
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
@@ -234,42 +266,10 @@ def sanitize_for_account(title: str) -> str:
     return s[:100]
 
 def hyperlink_formula(jira_base_url: str, key: str) -> str:
-    """Возвращает формулу Excel HYPERLINK без f-строк (устраняет SyntaxError на некоторых сборках).
-    Дублируем кавычки для Excel: " → "".
-    """
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
-    base = str(jira_base_url).rstrip('/')
-    return '=HYPERLINK("{}", "{}")'.format(f"{base}/browse/{k}", k)
-
-# ========= Нормы рабочего времени =========
-def build_month_norms(year: int) -> Dict[str, int]:
-    cal = Russia()
-    norms = {}
-    for m in range(1, 13):
-        start = datetime(year, m, 1)
-        end = (datetime(year, m+1, 1) - timedelta(days=1)) if m < 12 else datetime(year, 12, 31)
-        norms[f"{year}-{m:02d}"] = int(cal.get_working_days_delta(start.date(), end.date()))
-    # Точечные переопределения из ENV
-    if MONTH_NORM_OVERRIDE:
-        for part in MONTH_NORM_OVERRIDE.split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            ym, val = part.split("=", 1)
-            ym, val = ym.strip(), val.strip()
-            try:
-                norms[ym] = int(val)
-            except:
-                pass
-    return norms
-
-month_norms = build_month_norms(YEAR)
-
-def month_norm_days(ym: str) -> int:
-    # ym = "YYYY-MM"
-    return int(month_norms.get(ym, 20))
+    return f'=HYPERLINK("{jira_base_url.rstrip("/")}/browse/{k}","{k}")'
 
 # ========= 1) Tempo =========
 tempo_url = f"{JIRA_URL}/rest/tempo-timesheets/4/worklogs/search"
@@ -279,7 +279,7 @@ if resp.status_code != 200:
     print("Ошибка запроса к Tempo:", resp.status_code, resp.text); raise SystemExit(1)
 worklogs = resp.json() or []
 
-# ========= 2) Кеш пользователей =========
+# ========= 2) Кеш пользователей (для отображаемого имени) =========
 worker_ids = list({w.get("worker") for w in worklogs if w.get("worker")})
 worker_map_path = WL_DIR / 'worker_map.json'
 worker_map = load_json(worker_map_path)
@@ -291,7 +291,11 @@ if new_ids:
             worker_map[wid] = name
     save_json(worker_map_path, worker_map)
 
-# ========= 3) Кеш summary+labels =========
+# ========= 3) Кеш summary задач (для автозаполнения Account Key) =========
+summary_cache_path = WL_DIR / "issue_summary_cache.json"
+summary_cache = load_json(summary_cache_path)
+
+# ========= 3b) Кеш summary+labels для отчёта =========
 summary_labels_cache_path = WL_DIR / "issue_summary_labels_cache.json"
 summary_labels_cache = load_json(summary_labels_cache_path)
 
@@ -304,43 +308,38 @@ if need_keys_sl:
             summary_labels_cache[ikey] = data
     save_json(summary_labels_cache_path, summary_labels_cache)
 
-# ========= 4) Формирование строк =========
+# Подстрахуем старый summary_cache: если там нет, но есть в summary_labels_cache — дозаполним
+to_backfill = [k for k in all_issue_keys if k not in summary_cache and k in summary_labels_cache]
+if to_backfill:
+    for k in to_backfill:
+        summary_cache[k] = summary_labels_cache.get(k, {}).get("summary", "") or ""
+    save_json(summary_cache_path, summary_cache)
+
+# ========= 4) Нормы рабочего времени =========
+cal = Russia()
+month_norms = {}
+for m in range(1, 13):
+    start = datetime(YEAR, m, 1)
+    end = (datetime(YEAR, m+1, 1) - timedelta(days=1)) if m < 12 else datetime(YEAR, 12, 31)
+    month_norms[f"{YEAR}-{m:02d}"] = cal.get_working_days_delta(start.date(), end.date())
+
+# ========= 5) Формирование строк =========
 rows = []
 filled_cnt = 0
-
-# Функция безопасного парсинга даты с TZ нормализацией:
-def parse_started_ts(value) -> Optional[datetime]:
-    """
-    Преобразует Tempo started → локальное наивное время в заданном TIMEZONE.
-    Устраняет утечки в соседние месяцы из-за TZ.
-    """
-    try:
-        ts = pd.to_datetime(value, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return None
-        ts = ts.tz_convert(TIMEZONE).tz_localize(None)
-        return ts.to_pydatetime()
-    except Exception:
-        return None
-
 for w in worklogs:
     issue = w.get("issue") or {}
     attrs = w.get("attributes") or {}
     activity_type = (attrs.get("_Типактивности_", {}) or {}).get("value")
 
-    started_dt = parse_started_ts(w.get("started"))
-    ym = started_dt.strftime("%Y-%m") if started_dt else None
-    mmYYYY = started_dt.strftime("%m/%Y") if started_dt else None
+    started = pd.to_datetime(w.get("started"), errors="coerce")
+    ym = started.strftime("%Y-%m") if pd.notnull(started) else None
+    mmYYYY = started.strftime("%m/%Y") if pd.notnull(started) else None
 
     hours = (w.get("timeSpentSeconds") or 0) / 3600.0
-    # Построчный FTE:
-    if MONTH_NORM_HOURS > 0:
-        fte = hours / MONTH_NORM_HOURS
-    else:
-        days_norm = month_norm_days(ym) if ym else 20
-        fte = (hours / 8.0) / days_norm if days_norm else None
+    days  = hours / 8.0
+    fte   = (days / month_norms.get(ym, 20)) if ym else None
 
-    issue_key   = (issue.get("key") or "").strip()
+    issue_key   = issue.get("key")
     project_key = issue.get("projectKey")
     issue_type  = issue.get("issueType")
     account_key = issue.get("accountKey")
@@ -351,7 +350,8 @@ for w in worklogs:
     labels_for_report  = sl.get("labels", "") or ""
 
     if FILL_ACCOUNT_ENABLED and project_key in FILL_ACCOUNT_PROJECTS and not str(account_key or "").strip():
-        smry = summary_for_report or issue_key
+        # для автозаполнения account используем summary (из любого кэша)
+        smry = summary_for_report or summary_cache.get(issue_key) or issue_key
         account_key = f"{FILL_ACCOUNT_PREFIX}{sanitize_for_account(smry)}" if FILL_ACCOUNT_PREFIX else sanitize_for_account(smry)
         filled_cnt += 1
 
@@ -367,17 +367,18 @@ for w in worklogs:
         "FTE":                round(fte, 3) if fte is not None else None,
         "Summary":            summary_for_report,
         "Labels":             labels_for_report,
-        "_ym":                ym,                 # для агрегации
     })
 
 print(f"Автозаполнение Account Key из summary: {filled_cnt} задач.")
 
 df = pd.DataFrame(rows)
 
-# ========= 5) Русские названия + порядок + ссылка =========
+# ========= 6) Русские названия + порядок + ссылка =========
+# Ссылка
 df.insert(0, "Ссылка на задачу", df["IssueKey_tmp"].map(lambda k: hyperlink_formula(JIRA_URL, k)))
 df.drop(columns=["IssueKey_tmp"], inplace=True)
 
+# RU названия
 df.rename(columns={
     "Worker Name":        "Сотрудник",
     "Account Key":        "Сервис",
@@ -391,76 +392,26 @@ df.rename(columns={
     "Labels":             "Метки",
 }, inplace=True)
 
+# порядок (без «Сотрудник:Логин»)
 RU_ORDER = ["Тип задачи","Ссылка на задачу","Описание","Метки","Проект","Сервис","Месяц",
             "Сотрудник","Сотрудник:Категория","Сотрудник:ЦК","Сотрудник:Направление",
             "Тип активности","Часы факт","FTE факт","Ставка","Стоимость, ₽"]
-
 df = df[[c for c in RU_ORDER if c in df.columns] + [c for c in df.columns if c not in RU_ORDER]]
 
-# ====== RATES ENRICHMENT ======
+# ====== RATES ENRICHMENT (added) ======
 try:
     _rates_df = load_rate_directory_or_none(RATES_FOLDER, RATES_PATTERN)
     df = enrich_with_rates(df, _rates_df)
     df = reorder_final(df)
 except Exception as _e:
     print(f"[RATES] Ошибка обогащения ставками: {_e}")
-
-# ========= 6) Векторная агрегация FTE по месяцу/сотруднику =========
-# Приводим технический ключ месяца
-if "_ym" not in df.columns:
-    df["_ym"] = pd.to_datetime(df["Месяц"], format="%m/%Y", errors="coerce").dt.strftime("%Y-%m")
-
-# 1) Суммируем часы по сотруднику
-monthly = (
-    df.groupby(["_ym", "Сотрудник"], dropna=False)["Часы факт"]
-      .sum()
-      .reset_index()
-      .rename(columns={"_ym": "Месяц (YYYY-MM)"})
-)
-
-# 2) Добавляем норму и рассчитываем FTE месяц
-if MONTH_NORM_HOURS > 0:
-    monthly["Норма_дней"]  = None
-    monthly["Норма_часов"] = MONTH_NORM_HOURS
-    monthly["FTE месяц"]   = (monthly["Часы факт"] / MONTH_NORM_HOURS).round(3)
-else:
-    monthly["Норма_дней"]  = monthly["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
-    monthly["Норма_часов"] = (8 * monthly["Норма_дней"]).astype("Int64")
-    monthly["FTE месяц"]   = (monthly["Часы факт"] / monthly["Норма_часов"]).round(3)
-
-# 3) Общий FTE по месяцу (все сотрудники вместе) — чтобы сравнить с вашими руками
-monthly_total = (
-    monthly.groupby(["Месяц (YYYY-MM)"])["Часы факт"].sum().reset_index()
-)
-if MONTH_NORM_HOURS > 0:
-    monthly_total["Норма_дней"]  = None
-    monthly_total["Норма_часов"] = MONTH_NORM_HOURS
-    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / MONTH_NORM_HOURS).round(3)
-else:
-    monthly_total["Норма_дней"]  = monthly_total["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
-    monthly_total["Норма_часов"] = (8 * monthly_total["Норма_дней"]).astype("Int64")
-    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / monthly_total["Норма_часов"]).round(3)
-
-# 4) Диагностика конкретно для мая
-ym_check = f"{YEAR}-05"
-try:
-    may_hours_total = float(monthly_total.loc[monthly_total["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum())
-    if MONTH_NORM_HOURS > 0:
-        denom = MONTH_NORM_HOURS
-    else:
-        denom = 8 * month_norm_days(ym_check)
-    if denom:
-        print(f"[CHECK] МАЙ {YEAR}: Σчасы={may_hours_total}, знаменатель={denom}, ожидаемый FTE={may_hours_total/denom:.3f}")
-    print(f"[CHECK] Норма рабочих дней мая по workalendar/override: {month_norm_days(ym_check)} (env MONTH_NORM_OVERRIDE='{MONTH_NORM_OVERRIDE}')")
-except Exception as e:
-    print(f"[CHECK] Ошибка диагностики мая: {e}")
+# ======================================
 
 # ========= 7) RAW Excel =========
 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 raw_path = WL_DIR / f"worklogs_{stamp}.xlsx"
 with pd.ExcelWriter(raw_path, engine="openpyxl") as w:
-    df.to_excel(w, index=False, sheet_name="worklogs_raw")
-    monthly.to_excel(w, index=False, sheet_name="monthly_fte")
+    df.to_excel(w, index=False, sheet_name="Sheet1")
 if EXCEL_AUTOFIT:
     excel_autofit_smart(raw_path)
 print(f"✅ RAW: {raw_path}")
@@ -472,32 +423,20 @@ df_can, canon_log = canonize_fact(df, columns_map, coerce_types=True)
 if "Месяц" in df_can.columns:     df_can["Месяц"] = df_can["Месяц"].map(to_mmYYYY)
 if "Сотрудник" in df_can.columns: df_can["Сотрудник"] = df_can["Сотрудник"].map(norm_text)
 if "Сервис" in df_can.columns:    df_can["Сервис"] = df_can["Сервис"].map(norm_text)
+# на всякий — вдруг канон добавит лишний столбец логина, удалим
 if "Сотрудник:Логин" in df_can.columns:
     df_can.drop(columns=["Сотрудник:Логин"], inplace=True, errors="ignore")
+# и порядок как в RAW
 df_can = df_can[[c for c in RU_ORDER if c in df_can.columns] + [c for c in df_can.columns if c not in RU_ORDER]]
 
 can_path = WL_OUT_DIR / f"worklogs_canonical_{stamp}.xlsx"
 with pd.ExcelWriter(can_path, engine="openpyxl") as w:
     df_can.to_excel(w, index=False, sheet_name="worklogs")
-    monthly.to_excel(w, index=False, sheet_name="monthly_fte")  # кладём и сюда
     if not canon_log.empty:
         canon_log.to_excel(w, index=False, sheet_name="canonical_log")
 if EXCEL_AUTOFIT:
     excel_autofit_smart(can_path)
 
-write_schema_json(can_path.with_suffix(".schema.json"), {"worklogs": df_can, "monthly_fte": monthly})
+write_schema_json(can_path.with_suffix(".schema.json"), {"worklogs": df_can})
 print(f"✅ Canonical: {can_path}")
 print(f"🧾 Schema:    {can_path.with_suffix('.schema.json')}")
-
-# ========= 9) Диагностика (по желанию) =========
-try:
-    ym_check = f"{YEAR}-05"
-    may_hours = monthly.loc[monthly["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum()
-    if MONTH_NORM_HOURS > 0:
-        denom = MONTH_NORM_HOURS
-    else:
-        denom = 8 * month_norm_days(ym_check)
-    if denom:
-        print(f"[CHECK] Май {YEAR}: Σчасы={may_hours}, знаменатель={denom}, FTE={may_hours/denom:.3f}")
-except Exception:
-    pass

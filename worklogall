@@ -3,28 +3,19 @@ r"""
 Worklog.py — Tempo → русские колонки, кликабельные ссылки, без «Сотрудник:Логин».
 + Summary (Описание) и Labels (Метки) из Jira Issue fields.
 + FTE построчно и корректный помесячный FTE (monthly_fte + monthly_total).
-+ Норма рабочих дней берётся из ПРОИЗВОДСТВЕННОГО календаря РФ (prodcalendar), при его отсутствии — fallback на workalendar.
++ Норма рабочих дней считается по workalendar.europe.Russia (авто-год по фактическим датам списаний).
 + Векторная агрегация (без GroupBy.apply и без FutureWarning).
 + Безопасная функция Excel HYPERLINK (без f-строк).
 """
 
 import os, re, json, time, requests, pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import concurrent.futures
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from calendar import monthrange
 
-# === Календарь РФ ===
-# 1) производственный календарь (если установлен)
-try:
-    import prodcalendar as prodcal            # pip install prodcalendar
-    _HAS_PRODCAL = True
-except Exception:
-    prodcal = None
-    _HAS_PRODCAL = False
-
-# 2) fallback: workalendar Russia (праздники/переносы)
+# === Календарь РФ (workalendar) ===
 from workalendar.europe import Russia
 _CAL_RU = Russia()
 
@@ -32,19 +23,25 @@ _CAL_RU = Russia()
 from canon_utils import load_columns_map, canonize_fact, write_schema_json, norm_text, to_mmYYYY
 
 # ========= ENV =========
-JIRA_URL       = os.getenv("JIRA_URL", "").strip()
-BEARER_TOKEN   = os.getenv("JIRA_TEMPO_TOKEN", "").strip()
-# YEAR используется ТОЛЬКО для диапазона запроса в Tempo (from-to), на расчёт FTE не влияет
-YEAR           = int(os.getenv("YEAR", datetime.now().year))
-TIMEZONE       = os.getenv("TIMEZONE", "Europe/Moscow").strip()
+JIRA_URL     = os.getenv("JIRA_URL", "").strip()
+BEARER_TOKEN = os.getenv("JIRA_TEMPO_TOKEN", "").strip()
 
+# Окно выгрузки из Tempo (только для запроса; на расчёт FTE не влияет)
+# По умолчанию — текущий календарный год; можно переопределить env-переменными.
+_today = date.today()
+FROM_DATE = os.getenv("FROM_DATE", f"{_today.year}-01-01")
+TO_DATE   = os.getenv("TO_DATE",   f"{_today.year}-12-31")
+
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
+EXCEL_AUTOFIT = os.getenv("EXCEL_AUTOFIT", "1") == "1"
+
+# (опционально) Точечные переопределения РАБОЧИХ дней: "YYYY-MM=18;YYYY-MM=21"
+MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
+
+# (опционально) Автозаполнение Account Key по summary для проектов из списка
 FILL_ACCOUNT_ENABLED  = os.getenv("FILL_ACCOUNT_ENABLED", "1") == "1"
 FILL_ACCOUNT_PROJECTS = [p.strip() for p in os.getenv("FILL_ACCOUNT_PROJECTS", "INT").split(";") if p.strip()]
 FILL_ACCOUNT_PREFIX   = os.getenv("FILL_ACCOUNT_PREFIX", "INT: ")
-EXCEL_AUTOFIT         = os.getenv("EXCEL_AUTOFIT", "1") == "1"
-
-# (опционально) точечные переопределения числа РАБОЧИХ дней: "YYYY-MM=18;YYYY-MM=21"
-MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
 
 if not JIRA_URL or not BEARER_TOKEN:
     raise SystemExit("ENV JIRA_URL или JIRA_TEMPO_TOKEN не заданы")
@@ -252,61 +249,41 @@ def hyperlink_formula(jira_base_url: str, key: str) -> str:
     base = str(jira_base_url).rstrip('/')
     return '=HYPERLINK("{}", "{}")'.format("{}/browse/{}".format(base, k), k)
 
-# ========= Нормы рабочих дней: строго от фактических месяцев списаний =========
-# Cache: "YYYY-MM" -> int
+# ========= Нормы рабочих дней: строго по workalendar, год — по фактическим датам =========
 _WORKDAYS_CACHE: Dict[str, int] = {}
 
 def _iter_month_dates(year: int, month: int):
     days = monthrange(year, month)[1]
     for d in range(1, days + 1):
-        yield datetime(year, month, d).date()
+        yield date(year, month, d)
 
 def workdays_for_ym(ym: str) -> int:
-    """Количество рабочих дней в месяце ym='YYYY-MM' по произв. календарю РФ, fallback — workalendar.
-       Учитываются переносы/рабочие субботы (если prodcalendar установлен).
+    """Количество рабочих дней в ym='YYYY-MM' по workalendar.Russia.
+       Учитываются праздники и переносы, включая рабочие субботы.
     """
     if not ym:
         return 20
     if ym in _WORKDAYS_CACHE:
         return _WORKDAYS_CACHE[ym]
 
-    # override из ENV имеет высший приоритет (если задан)
+    # override из ENV имеет наивысший приоритет (если задан)
     if MONTH_NORM_OVERRIDE:
-        parts = [p.strip() for p in MONTH_NORM_OVERRIDE.split(";") if "=" in p]
-        for part in parts:
+        for part in (p.strip() for p in MONTH_NORM_OVERRIDE.split(";") if "=" in p):
             ym_key, val = [x.strip() for x in part.split("=", 1)]
             if ym_key == ym:
-                try:
-                    _WORKDAYS_CACHE[ym] = int(val)
-                    return _WORKDAYS_CACHE[ym]
-                except:
-                    pass
+                _WORKDAYS_CACHE[ym] = int(val)
+                return _WORKDAYS_CACHE[ym]
 
     y, m = map(int, ym.split("-"))
-
-    # 1) prodcalendar
-    if _HAS_PRODCAL:
-        cnt = 0
-        for dt in _iter_month_dates(y, m):
-            try:
-                if prodcal.is_working_day(dt):
-                    cnt += 1
-            except Exception:
-                if dt.weekday() < 5:
-                    cnt += 1
-        _WORKDAYS_CACHE[ym] = cnt
-        return cnt
-
-    # 2) fallback: workalendar
-    start = datetime(y, m, 1).date()
-    end   = (datetime(y, m+1, 1) - timedelta(days=1)).date() if m < 12 else datetime(y, 12, 31).date()
-    cnt = int(_CAL_RU.get_working_days_delta(start, end))
-    _WORKDAYS_CACHE[ym] = cnt
-    return cnt
+    start = date(y, m, 1)
+    end   = (date(y, m+1, 1) - timedelta(days=1)) if m < 12 else date(y, 12, 31)
+    days = int(_CAL_RU.get_working_days_delta(start, end))
+    _WORKDAYS_CACHE[ym] = days
+    return days
 
 # ========= Tempo fetch =========
 tempo_url = f"{JIRA_URL}/rest/tempo-timesheets/4/worklogs/search"
-payload = {"from": f"{YEAR}-01-01", "to": f"{YEAR}-12-31"}  # YEAR только для окна выгрузки
+payload = {"from": FROM_DATE, "to": TO_DATE}
 resp = requests.post(tempo_url, json=payload, headers=HEADERS, timeout=120)
 if resp.status_code != 200:
     print("Ошибка запроса к Tempo:", resp.status_code, resp.text); raise SystemExit(1)
@@ -401,6 +378,13 @@ print(f"Автозаполнение Account Key из summary: {filled_cnt} за
 df = pd.DataFrame(rows)
 
 # ========= RU + ссылка =========
+def hyperlink_formula(jira_base_url: str, key: str) -> str:
+    if not key:
+        return ""
+    k = str(key).strip().replace('"', '""')
+    base = str(jira_base_url).rstrip('/')
+    return '=HYPERLINK("{}", "{}")'.format("{}/browse/{}".format(base, k), k)
+
 df.insert(0, "Ссылка на задачу", df["IssueKey_tmp"].map(lambda k: hyperlink_formula(JIRA_URL, k)))
 df.drop(columns=["IssueKey_tmp"], inplace=True)
 df.rename(columns={
@@ -491,7 +475,7 @@ write_schema_json(can_path.with_suffix(".schema.json"),
 print(f"✅ Canonical: {can_path}")
 print(f"🧾 Schema:    {can_path.with_suffix('.schema.json')}")
 
-# ========= Диагностика (пример для мая 2025) =========
+# ========= Диагностика (пример: май 2025) =========
 try:
     ym_check = "2025-05"
     may_hours_total = float(monthly_total.loc[monthly_total["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum())

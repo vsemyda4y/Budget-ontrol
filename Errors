@@ -1,3 +1,2 @@
-line 376
-    it = by_key
-IndentationError: unexpected indent
+C:\Users\zaytsev_ra2\PycharmProjects\TCO\Контроль 2.py:428: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  df.groupby(["_ym","Сотрудник"], dropna=False)

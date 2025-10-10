@@ -234,10 +234,14 @@ def sanitize_for_account(title: str) -> str:
     return s[:100]
 
 def hyperlink_formula(jira_base_url: str, key: str) -> str:
+    """Возвращает формулу Excel HYPERLINK без f-строк (устраняет SyntaxError на некоторых сборках).
+    Дублируем кавычки для Excel: " → "".
+    """
     if not key:
         return ""
     k = str(key).strip().replace('"', '""')
-    return f'=HYPERLINK("{jira_base_url.rstrip('/')}/browse/{k}","{k}")'
+    base = str(jira_base_url).rstrip('/')
+    return '=HYPERLINK("{}", "{}")'.format(f"{base}/browse/{k}", k)
 
 # ========= Нормы рабочего времени =========
 def build_month_norms(year: int) -> Dict[str, int]:

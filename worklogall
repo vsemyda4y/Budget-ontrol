@@ -406,7 +406,7 @@ except Exception as _e:
 if "_ym" not in df.columns:
     df["_ym"] = pd.to_datetime(df["Месяц"], format="%m/%Y", errors="coerce").dt.strftime("%Y-%m")
 
-# 1) Суммируем часы
+# 1) Суммируем часы по сотруднику
 monthly = (
     df.groupby(["_ym", "Сотрудник"], dropna=False)["Часы факт"]
       .sum()
@@ -423,6 +423,33 @@ else:
     monthly["Норма_дней"]  = monthly["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
     monthly["Норма_часов"] = (8 * monthly["Норма_дней"]).astype("Int64")
     monthly["FTE месяц"]   = (monthly["Часы факт"] / monthly["Норма_часов"]).round(3)
+
+# 3) Общий FTE по месяцу (все сотрудники вместе) — чтобы сравнить с вашими руками
+monthly_total = (
+    monthly.groupby(["Месяц (YYYY-MM)"])["Часы факт"].sum().reset_index()
+)
+if MONTH_NORM_HOURS > 0:
+    monthly_total["Норма_дней"]  = None
+    monthly_total["Норма_часов"] = MONTH_NORM_HOURS
+    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / MONTH_NORM_HOURS).round(3)
+else:
+    monthly_total["Норма_дней"]  = monthly_total["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
+    monthly_total["Норма_часов"] = (8 * monthly_total["Норма_дней"]).astype("Int64")
+    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / monthly_total["Норма_часов"]).round(3)
+
+# 4) Диагностика конкретно для мая
+ym_check = f"{YEAR}-05"
+try:
+    may_hours_total = float(monthly_total.loc[monthly_total["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum())
+    if MONTH_NORM_HOURS > 0:
+        denom = MONTH_NORM_HOURS
+    else:
+        denom = 8 * month_norm_days(ym_check)
+    if denom:
+        print(f"[CHECK] МАЙ {YEAR}: Σчасы={may_hours_total}, знаменатель={denom}, ожидаемый FTE={may_hours_total/denom:.3f}")
+    print(f"[CHECK] Норма рабочих дней мая по workalendar/override: {month_norm_days(ym_check)} (env MONTH_NORM_OVERRIDE='{MONTH_NORM_OVERRIDE}')")
+except Exception as e:
+    print(f"[CHECK] Ошибка диагностики мая: {e}")
 
 # ========= 7) RAW Excel =========
 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

@@ -2,62 +2,63 @@
 r"""
 Worklog.py — Tempo → русские колонки, кликабельные ссылки, без «Сотрудник:Логин».
 + Summary (Описание) и Labels (Метки) из Jira Issue fields.
-+ FTE построчно (как было) и корректный помесячный FTE в отдельном листе (monthly_fte + monthly_total).
-+ Нормы рабочих дней — из производственного календаря РФ (prodcalendar), fallback — workalendar.
-+ Векторная агрегация без apply (нет FutureWarning).
-+ Безопасная функция HYPERLINK без f-строк.
++ FTE построчно и корректный помесячный FTE (monthly_fte + monthly_total).
++ Норма рабочих дней берётся из ПРОИЗВОДСТВЕННОГО календаря РФ (prodcalendar), при его отсутствии — fallback на workalendar.
++ Векторная агрегация (без GroupBy.apply и без FutureWarning).
++ Безопасная функция Excel HYPERLINK (без f-строк).
 """
 
 import os, re, json, time, requests, pandas as pd
 from datetime import datetime, timedelta
 import concurrent.futures
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 from calendar import monthrange
 
-from workalendar.europe import Russia
-
-# Optional: use official Russian production calendar if installed
+# === Календарь РФ ===
+# 1) производственный календарь (если установлен)
 try:
-    import prodcalendar as prodcal  # pip install prodcalendar
+    import prodcalendar as prodcal            # pip install prodcalendar
     _HAS_PRODCAL = True
 except Exception:
     prodcal = None
     _HAS_PRODCAL = False
 
+# 2) fallback: workalendar Russia (праздники/переносы)
+from workalendar.europe import Russia
+_CAL_RU = Russia()
+
+# === canon utils (ваши вспомогательные) ===
 from canon_utils import load_columns_map, canonize_fact, write_schema_json, norm_text, to_mmYYYY
 
 # ========= ENV =========
 JIRA_URL       = os.getenv("JIRA_URL", "").strip()
 BEARER_TOKEN   = os.getenv("JIRA_TEMPO_TOKEN", "").strip()
+# YEAR используется ТОЛЬКО для диапазона запроса в Tempo (from-to), на расчёт FTE не влияет
 YEAR           = int(os.getenv("YEAR", datetime.now().year))
 TIMEZONE       = os.getenv("TIMEZONE", "Europe/Moscow").strip()
-
-# Нормы: 0 -> считаем по календарю; если >0, используем фиксированные часы/месяц (например, 160)
-MONTH_NORM_HOURS = float(os.getenv("MONTH_NORM_HOURS", "0"))
-
-# Точечные переопределения нормы рабочих дней: "YYYY-MM=18;YYYY-MM=21"
-MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
-
-# Использовать производственный календарь РФ (prodcalendar) при наличии
-USE_PRODUCTION_CALENDAR = os.getenv("USE_PRODUCTION_CALENDAR", "1") == "1"
-
-if not JIRA_URL or not BEARER_TOKEN:
-    raise SystemExit("ENV JIRA_URL или JIRA_TEMPO_TOKEN не заданы")
 
 FILL_ACCOUNT_ENABLED  = os.getenv("FILL_ACCOUNT_ENABLED", "1") == "1"
 FILL_ACCOUNT_PROJECTS = [p.strip() for p in os.getenv("FILL_ACCOUNT_PROJECTS", "INT").split(";") if p.strip()]
 FILL_ACCOUNT_PREFIX   = os.getenv("FILL_ACCOUNT_PREFIX", "INT: ")
-EXCEL_AUTOFIT         = os.getenv("EXCEL_AUTOFIT", "1") == "1"  # умный автофит
+EXCEL_AUTOFIT         = os.getenv("EXCEL_AUTOFIT", "1") == "1"
 
+# (опционально) точечные переопределения числа РАБОЧИХ дней: "YYYY-MM=18;YYYY-MM=21"
+MONTH_NORM_OVERRIDE = os.getenv("MONTH_NORM_OVERRIDE", "")
+
+if not JIRA_URL or not BEARER_TOKEN:
+    raise SystemExit("ENV JIRA_URL или JIRA_TEMPO_TOKEN не заданы")
+
+# ========= Папки =========
 WL_DIR     = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\TCO\WL")
 WL_OUT_DIR = WL_DIR / "Результат"
+WL_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ====== Rates directory config ======
 RATES_FOLDER  = Path(r"C:\Users\zaytsev_ra2\PycharmProjects\Контроль бюджета\Ставки")
-RATES_PATTERN = "employee_rate_directory_*.xlsx"  # mask for the rates files
+RATES_PATTERN = "employee_rate_directory_*.xlsx"
 
-# ================= helpers for rates =================
+# ========= Helpers: выбор колонок/файлов и пр. =========
 def _pick_latest_file(folder: Path, pattern: str) -> Optional[Path]:
     files = sorted(Path(folder).glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
@@ -142,7 +143,6 @@ def enrich_with_rates(df: pd.DataFrame, rates: Optional[pd.DataFrame]) -> pd.Dat
             merged = merged.drop(columns=[c])
     return merged
 
-# ====== Final column order helper ======
 FINAL_ORDER = ["Тип задачи", "Ссылка на задачу", "Описание", "Метки", "Проект", "Сервис", "Месяц",
                "Сотрудник", "Сотрудник:Категория", "Сотрудник:ЦК", "Сотрудник:Направление",
                "Тип активности", "Часы факт", "FTE факт", "Ставка", "Стоимость, ₽"]
@@ -152,8 +152,6 @@ def reorder_final(df: pd.DataFrame) -> pd.DataFrame:
     rest = [c for c in df.columns if c not in keep]
     return df[keep + rest]
 
-# ============================================
-WL_OUT_DIR.mkdir(parents=True, exist_ok=True)
 COLUMNS_MAP_PATH = Path(__file__).with_name("columns_map.json")
 
 HEADERS = {
@@ -194,7 +192,7 @@ def excel_autofit_smart(path: Path):
     except Exception as e:
         print(f"[autofit] пропущено: {e}")
 
-# ========= misc helpers =========
+# ========= JSON helpers =========
 def load_json(path: Path) -> Dict[str, str]:
     if path.exists():
         try:
@@ -211,6 +209,7 @@ def save_json(path: Path, data: Dict[str, str]):
     except Exception as e:
         print(f"[cache] не удалось сохранить {path.name}: {e}")
 
+# ========= Jira/Tempo helpers =========
 def get_display_name(wid: str) -> Tuple[str, str]:
     url = f"{JIRA_URL}/rest/api/2/user?key={wid}"
     try:
@@ -244,7 +243,7 @@ def sanitize_for_account(title: str) -> str:
     return s[:100]
 
 def hyperlink_formula(jira_base_url: str, key: str) -> str:
-    """Возвращает формулу Excel HYPERLINK без f-строк (устраняет SyntaxError на некоторых сборках).
+    """Возвращает строку формулы Excel HYPERLINK без f-строк (устраняет SyntaxError).
     Дублируем кавычки для Excel: " → "".
     """
     if not key:
@@ -253,71 +252,67 @@ def hyperlink_formula(jira_base_url: str, key: str) -> str:
     base = str(jira_base_url).rstrip('/')
     return '=HYPERLINK("{}", "{}")'.format("{}/browse/{}".format(base, k), k)
 
-# ========= Нормы рабочего времени =========
+# ========= Нормы рабочих дней: строго от фактических месяцев списаний =========
+# Cache: "YYYY-MM" -> int
+_WORKDAYS_CACHE: Dict[str, int] = {}
+
 def _iter_month_dates(year: int, month: int):
     days = monthrange(year, month)[1]
     for d in range(1, days + 1):
         yield datetime(year, month, d).date()
 
-def build_month_norms(year: int) -> Dict[str, int]:
+def workdays_for_ym(ym: str) -> int:
+    """Количество рабочих дней в месяце ym='YYYY-MM' по произв. календарю РФ, fallback — workalendar.
+       Учитываются переносы/рабочие субботы (если prodcalendar установлен).
     """
-    Возвращает нормы РАБОЧИХ ДНЕЙ по месяцам (YYYY-MM -> int).
-    Приоритеты:
-    1) prodcalendar (официальный производственный календарь РФ), если установлен и USE_PRODUCTION_CALENDAR=1
-    2) workalendar.europe.Russia (как fallback)
-    3) Переопределения через MONTH_NORM_OVERRIDE применяются поверх любого источника
-    """
-    norms: Dict[str, int] = {}
+    if not ym:
+        return 20
+    if ym in _WORKDAYS_CACHE:
+        return _WORKDAYS_CACHE[ym]
 
-    if USE_PRODUCTION_CALENDAR and _HAS_PRODCAL:
-        # prodcalendar: учитывает переносы и рабочие субботы
-        for m in range(1, 13):
-            cnt = 0
-            for dt in _iter_month_dates(year, m):
-                try:
-                    if prodcal.is_working_day(dt):
-                        cnt += 1
-                except Exception:
-                    if dt.weekday() < 5:
-                        cnt += 1
-            norms["{}-{:02d}".format(year, m)] = cnt
-    else:
-        # Fallback: workalendar
-        cal = Russia()
-        for m in range(1, 13):
-            start = datetime(year, m, 1)
-            end = (datetime(year, m+1, 1) - timedelta(days=1)) if m < 12 else datetime(year, 12, 31)
-            norms["{}-{:02d}".format(year, m)] = int(cal.get_working_days_delta(start.date(), end.date()))
-
-    # Точечные переопределения из ENV применяются в конце
+    # override из ENV имеет высший приоритет (если задан)
     if MONTH_NORM_OVERRIDE:
-        for part in MONTH_NORM_OVERRIDE.split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            ym, val = part.split("=", 1)
-            ym, val = ym.strip(), val.strip()
+        parts = [p.strip() for p in MONTH_NORM_OVERRIDE.split(";") if "=" in p]
+        for part in parts:
+            ym_key, val = [x.strip() for x in part.split("=", 1)]
+            if ym_key == ym:
+                try:
+                    _WORKDAYS_CACHE[ym] = int(val)
+                    return _WORKDAYS_CACHE[ym]
+                except:
+                    pass
+
+    y, m = map(int, ym.split("-"))
+
+    # 1) prodcalendar
+    if _HAS_PRODCAL:
+        cnt = 0
+        for dt in _iter_month_dates(y, m):
             try:
-                norms[ym] = int(val)
-            except:
-                pass
-    return norms
+                if prodcal.is_working_day(dt):
+                    cnt += 1
+            except Exception:
+                if dt.weekday() < 5:
+                    cnt += 1
+        _WORKDAYS_CACHE[ym] = cnt
+        return cnt
 
-month_norms = build_month_norms(YEAR)
+    # 2) fallback: workalendar
+    start = datetime(y, m, 1).date()
+    end   = (datetime(y, m+1, 1) - timedelta(days=1)).date() if m < 12 else datetime(y, 12, 31).date()
+    cnt = int(_CAL_RU.get_working_days_delta(start, end))
+    _WORKDAYS_CACHE[ym] = cnt
+    return cnt
 
-def month_norm_days(ym: str) -> int:
-    # ym = "YYYY-MM"
-    return int(month_norms.get(ym, 20))
-
-# ========= 1) Tempo =========
+# ========= Tempo fetch =========
 tempo_url = f"{JIRA_URL}/rest/tempo-timesheets/4/worklogs/search"
-payload = {"from": f"{YEAR}-01-01", "to": f"{YEAR}-12-31"}
+payload = {"from": f"{YEAR}-01-01", "to": f"{YEAR}-12-31"}  # YEAR только для окна выгрузки
 resp = requests.post(tempo_url, json=payload, headers=HEADERS, timeout=120)
 if resp.status_code != 200:
     print("Ошибка запроса к Tempo:", resp.status_code, resp.text); raise SystemExit(1)
 worklogs = resp.json() or []
 
-# ========= 2) Кеш пользователей =========
+# ========= Users cache =========
 worker_ids = list({w.get("worker") for w in worklogs if w.get("worker")})
 worker_map_path = WL_DIR / 'worker_map.json'
 worker_map = load_json(worker_map_path)
@@ -329,7 +324,7 @@ if new_ids:
             worker_map[wid] = name
     save_json(worker_map_path, worker_map)
 
-# ========= 3) Кеш summary+labels =========
+# ========= Summary/labels cache =========
 summary_labels_cache_path = WL_DIR / "issue_summary_labels_cache.json"
 summary_labels_cache = load_json(summary_labels_cache_path)
 
@@ -342,16 +337,9 @@ if need_keys_sl:
             summary_labels_cache[ikey] = data
     save_json(summary_labels_cache_path, summary_labels_cache)
 
-# ========= 4) Формирование строк =========
-rows = []
-filled_cnt = 0
-
-# Функция безопасного парсинга даты с TZ нормализацией:
+# ========= Rows build =========
 def parse_started_ts(value) -> Optional[datetime]:
-    """
-    Преобразует Tempo started → локальное наивное время в заданном TIMEZONE.
-    Устраняет утечки в соседние месяцы из-за TZ.
-    """
+    """Tempo started (UTC aware) → локальное наивное время (TIMEZONE)."""
     try:
         ts = pd.to_datetime(value, utc=True, errors="coerce")
         if pd.isna(ts):
@@ -360,6 +348,9 @@ def parse_started_ts(value) -> Optional[datetime]:
         return ts.to_pydatetime()
     except Exception:
         return None
+
+rows = []
+filled_cnt = 0
 
 for w in worklogs:
     issue = w.get("issue") or {}
@@ -371,19 +362,16 @@ for w in worklogs:
     mmYYYY = started_dt.strftime("%m/%Y") if started_dt else None
 
     hours = (w.get("timeSpentSeconds") or 0) / 3600.0
-    # Построчный FTE (для информации; для отчёта по месяцу используем агрегированный расчёт ниже)
-    if MONTH_NORM_HOURS > 0:
-        fte = hours / MONTH_NORM_HOURS
-    else:
-        days_norm = month_norm_days(ym) if ym else 20
-        fte = (hours / 8.0) / days_norm if days_norm else None
+
+    # FTE построчно строго от рабочих дней ФАКТИЧЕСКОГО месяца:
+    days_norm = workdays_for_ym(ym) if ym else 20
+    fte = (hours / (8.0 * days_norm)) if days_norm else None
 
     issue_key   = (issue.get("key") or "").strip()
     project_key = issue.get("projectKey")
     issue_type  = issue.get("issueType")
     account_key = issue.get("accountKey")
 
-    # Summary/Labels из кэша
     sl = summary_labels_cache.get(issue_key) or {"summary": "", "labels": ""}
     summary_for_report = sl.get("summary", "") or ""
     labels_for_report  = sl.get("labels", "") or ""
@@ -394,7 +382,7 @@ for w in worklogs:
         filled_cnt += 1
 
     rows.append({
-        "IssueKey_tmp": issue_key,                 # для ссылки (не попадёт в итог)
+        "IssueKey_tmp": issue_key,
         "Worker Name":  worker_map.get(w.get("worker"), w.get("worker")),
         "Account Key":  account_key,
         "Project Key":  project_key,
@@ -405,17 +393,16 @@ for w in worklogs:
         "FTE":                round(fte, 3) if fte is not None else None,
         "Summary":            summary_for_report,
         "Labels":             labels_for_report,
-        "_ym":                ym,                 # для агрегации
+        "_ym":                ym,  # для агрегации
     })
 
 print(f"Автозаполнение Account Key из summary: {filled_cnt} задач.")
 
 df = pd.DataFrame(rows)
 
-# ========= 5) Русские названия + порядок + ссылка =========
+# ========= RU + ссылка =========
 df.insert(0, "Ссылка на задачу", df["IssueKey_tmp"].map(lambda k: hyperlink_formula(JIRA_URL, k)))
 df.drop(columns=["IssueKey_tmp"], inplace=True)
-
 df.rename(columns={
     "Worker Name":        "Сотрудник",
     "Account Key":        "Сервис",
@@ -432,10 +419,9 @@ df.rename(columns={
 RU_ORDER = ["Тип задачи","Ссылка на задачу","Описание","Метки","Проект","Сервис","Месяц",
             "Сотрудник","Сотрудник:Категория","Сотрудник:ЦК","Сотрудник:Направление",
             "Тип активности","Часы факт","FTE факт","Ставка","Стоимость, ₽"]
-
 df = df[[c for c in RU_ORDER if c in df.columns] + [c for c in df.columns if c not in RU_ORDER]]
 
-# ====== RATES ENRICHMENT ======
+# ====== Ставки ======
 try:
     _rates_df = load_rate_directory_or_none(RATES_FOLDER, RATES_PATTERN)
     df = enrich_with_rates(df, _rates_df)
@@ -443,45 +429,33 @@ try:
 except Exception as _e:
     print(f"[RATES] Ошибка обогащения ставками: {_e}")
 
-# ========= 6) Векторная агрегация FTE =========
-# Приводим технический ключ месяца
+# ========= Агрегация (векторно) =========
+# тех. ключ месяца
 if "_ym" not in df.columns:
     df["_ym"] = pd.to_datetime(df["Месяц"], format="%m/%Y", errors="coerce").dt.strftime("%Y-%m")
 
-# 1) FTE по месяцу и сотруднику
+# 1) по сотруднику и месяцу
 monthly = (
     df.groupby(["_ym", "Сотрудник"], dropna=False)["Часы факт"]
       .sum()
       .reset_index()
       .rename(columns={"_ym": "Месяц (YYYY-MM)"})
 )
+monthly["Норма_дней"]  = monthly["Месяц (YYYY-MM)"].map(workdays_for_ym).astype("Int64")
+monthly["Норма_часов"] = (8 * monthly["Норма_дней"]).astype("Int64")
+monthly["FTE месяц"]   = (monthly["Часы факт"] / monthly["Норма_часов"]).round(3)
 
-if MONTH_NORM_HOURS > 0:
-    monthly["Норма_дней"]  = None
-    monthly["Норма_часов"] = MONTH_NORM_HOURS
-    monthly["FTE месяц"]   = (monthly["Часы факт"] / MONTH_NORM_HOURS).round(3)
-else:
-    monthly["Норма_дней"]  = monthly["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
-    monthly["Норма_часов"] = (8 * monthly["Норма_дней"]).astype("Int64")
-    monthly["FTE месяц"]   = (monthly["Часы факт"] / monthly["Норма_часов"]).round(3)
-
-# 2) Итог по месяцу (все сотрудники)
+# 2) итого по месяцу
 monthly_total = (
     monthly.groupby(["Месяц (YYYY-MM)"])["Часы факт"]
            .sum()
            .reset_index()
 )
+monthly_total["Норма_дней"]  = monthly_total["Месяц (YYYY-MM)"].map(workdays_for_ym).astype("Int64")
+monthly_total["Норма_часов"] = (8 * monthly_total["Норма_дней"]).astype("Int64")
+monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / monthly_total["Норма_часов"]).round(3)
 
-if MONTH_NORM_HOURS > 0:
-    monthly_total["Норма_дней"]  = None
-    monthly_total["Норма_часов"] = MONTH_NORM_HOURS
-    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / MONTH_NORM_HOURS).round(3)
-else:
-    monthly_total["Норма_дней"]  = monthly_total["Месяц (YYYY-MM)"].map(month_norm_days).astype("Int64")
-    monthly_total["Норма_часов"] = (8 * monthly_total["Норма_дней"]).astype("Int64")
-    monthly_total["FTE месяц (итого)"] = (monthly_total["Часы факт"] / monthly_total["Норма_часов"]).round(3)
-
-# ========= 7) RAW Excel =========
+# ========= Excel =========
 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 raw_path = WL_DIR / f"worklogs_{stamp}.xlsx"
 with pd.ExcelWriter(raw_path, engine="openpyxl") as w:
@@ -492,10 +466,9 @@ if EXCEL_AUTOFIT:
     excel_autofit_smart(raw_path)
 print(f"✅ RAW: {raw_path}")
 
-# ========= 8) Canonical =========
+# ========= Canonical =========
 columns_map = load_columns_map(COLUMNS_MAP_PATH)
 df_can, canon_log = canonize_fact(df, columns_map, coerce_types=True)
-# финальная нормализация
 if "Месяц" in df_can.columns:     df_can["Месяц"] = df_can["Месяц"].map(to_mmYYYY)
 if "Сотрудник" in df_can.columns: df_can["Сотрудник"] = df_can["Сотрудник"].map(norm_text)
 if "Сервис" in df_can.columns:    df_can["Сервис"] = df_can["Сервис"].map(norm_text)
@@ -513,20 +486,18 @@ with pd.ExcelWriter(can_path, engine="openpyxl") as w:
 if EXCEL_AUTOFIT:
     excel_autofit_smart(can_path)
 
-write_schema_json(can_path.with_suffix(".schema.json"), {"worklogs": df_can, "monthly_fte": monthly, "monthly_total": monthly_total})
+write_schema_json(can_path.with_suffix(".schema.json"),
+                  {"worklogs": df_can, "monthly_fte": monthly, "monthly_total": monthly_total})
 print(f"✅ Canonical: {can_path}")
 print(f"🧾 Schema:    {can_path.with_suffix('.schema.json')}")
 
-# ========= 9) Диагностика =========
+# ========= Диагностика (пример для мая 2025) =========
 try:
-    ym_check = f"{YEAR}-05"
+    ym_check = "2025-05"
     may_hours_total = float(monthly_total.loc[monthly_total["Месяц (YYYY-MM)"].eq(ym_check), "Часы факт"].sum())
-    if MONTH_NORM_HOURS > 0:
-        denom = MONTH_NORM_HOURS
-    else:
-        denom = 8 * month_norm_days(ym_check)
+    rdays = workdays_for_ym(ym_check)
+    denom = 8 * rdays
     if denom:
-        print(f"[CHECK] МАЙ {YEAR}: Σчасы={may_hours_total}, знаменатель={denom}, ожидаемый FTE={may_hours_total/denom:.3f}")
-    print(f"[CHECK] Источник норм: {'prodcalendar' if (USE_PRODUCTION_CALENDAR and _HAS_PRODCAL) else 'workalendar'}; override='{MONTH_NORM_OVERRIDE}'")
+        print(f"[CHECK] МАЙ 2025: Σчасы={may_hours_total}, раб_дней={rdays}, знаменатель={denom}, FTE={may_hours_total/denom:.3f}")
 except Exception as e:
     print(f"[CHECK] Ошибка диагностики мая: {e}")
